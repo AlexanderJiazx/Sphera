@@ -1,0 +1,43 @@
+// swift-tools-version: 6.0
+
+import PackageDescription
+
+let package = Package(
+  name: "SpheraCoreVerification",
+  platforms: [.macOS(.v15)],
+  products: [
+    .library(name: "SpheraCore", targets: ["SpheraCore"])
+  ],
+  targets: [
+    .target(
+      name: "SpheraCore",
+      path: "Sphera",
+      exclude: [
+        "EngineBridge",
+        "CameraCaptureService.swift",
+        "CameraPreviewView.swift",
+        "CaptureGuideView.swift",
+        "CaptureViewModel.swift",
+        "ContentView.swift",
+        "MotionTrackingService.swift",
+        "OpenCVSpheraEngine.swift",
+        "PanoramaViewer.swift",
+        "Sphera-Bridging-Header.h",
+        "SpheraApp.swift",
+      ],
+      sources: [
+        "AlignmentHoldTracker.swift",
+        "CaptureNavigation.swift",
+        "CaptureModels.swift",
+        "CapturePackageStore.swift",
+        "OrientationMath.swift",
+        "PanoramaStitching.swift",
+      ]
+    ),
+    .testTarget(
+      name: "SpheraCoreTests",
+      dependencies: ["SpheraCore"],
+      path: "SpheraCoreTests"
+    ),
+  ]
+)
