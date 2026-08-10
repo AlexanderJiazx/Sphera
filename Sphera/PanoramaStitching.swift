@@ -6,7 +6,6 @@ struct SpheraEngineRequest: Sendable {
   let manifestURL: URL
   let outputDirectoryURL: URL
   let initialCameraRotations: [Matrix3x3Value]
-  let maximumPoseRefinementDegrees: Double
 }
 
 protocol NativeSpheraEngine: Sendable {
@@ -45,9 +44,7 @@ actor SpheraEngineAdapter: PanoramaStitching {
       outputDirectoryURL: outputDirectory,
       initialCameraRotations: package.manifest.frames.map {
         $0.pose.cameraToCaptureReferenceRotationMatrix
-      },
-      maximumPoseRefinementDegrees: package.manifest
-        .engineInitialization.maximumPoseRefinementDegrees
+      }
     )
 
     if let nativeEngine {

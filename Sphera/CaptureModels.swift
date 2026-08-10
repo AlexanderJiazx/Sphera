@@ -336,7 +336,8 @@ struct EngineInitializationMetadata: Codable, Equatable, Sendable {
   let rotationField: String
   let usePosePriors: Bool
   let allowGlobalArrangementRediscovery: Bool
-  let maximumPoseRefinementDegrees: Double
+  /// Unused on the outdoor estimate path (`null` in the winning Engine recipe).
+  let maximumPoseRefinementDegrees: Double?
   let refinementPurpose: String
   let enabledPipelineStages: [String]
 }

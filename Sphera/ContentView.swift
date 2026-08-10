@@ -13,15 +13,17 @@ struct ContentView: View {
         StatusView(title: "Preparing capture", detail: model.statusMessage)
       case .capturing:
         CaptureScreen(model: model)
+      case .saved(let package):
+        SavedCaptureView(package: package, model: model)
       case .stitching:
-        StatusView(title: "Stitching panorama", detail: model.statusMessage)
+        StatusView(title: "Computing panorama", detail: model.statusMessage)
       case .completed(let completion):
         CaptureResultView(completion: completion) {
-          model.prepareNewCapture()
+          model.returnToSetup()
         }
       case .failed(let message):
         FailureView(message: message) {
-          model.prepareNewCapture()
+          model.returnToSetup()
         }
       }
     }
@@ -63,6 +65,14 @@ private struct CaptureSetupView: View {
           }
           .frame(maxWidth: .infinity)
           .buttonStyle(.borderedProminent)
+        }
+
+        Section {
+          NavigationLink {
+            GalleryView(model: model)
+          } label: {
+            Label("Gallery", systemImage: "photo.on.rectangle.angled")
+          }
         }
       }
       .navigationTitle("Sphera Capture")
@@ -142,6 +152,104 @@ private struct CaptureScreen: View {
   }
 }
 
+private struct SavedCaptureView: View {
+  let package: CapturePackage
+  @ObservedObject var model: CaptureViewModel
+  @State private var sharePayload: SharePayload?
+  @State private var shareErrorMessage: String?
+  @State private var isPreparingShare = false
+
+  var body: some View {
+    NavigationStack {
+      VStack(spacing: 20) {
+        Spacer()
+        Image(systemName: "checkmark.circle.fill")
+          .font(.system(size: 52))
+          .foregroundStyle(.green)
+        Text("Capture saved")
+          .font(.title2.bold())
+        Text(
+          "\(package.manifest.frames.count) frames with camera, pose, and gyroscope data are in the gallery. Compute on device when you want a panorama."
+        )
+        .font(.body)
+        .foregroundStyle(.secondary)
+        .multilineTextAlignment(.center)
+        .padding(.horizontal)
+
+        VStack(spacing: 12) {
+          Button {
+            Task {
+              await model.computeOnDevice(package: package)
+            }
+          } label: {
+            Label("Compute on device", systemImage: "cpu")
+              .frame(maxWidth: .infinity)
+          }
+          .buttonStyle(.borderedProminent)
+
+          Button {
+            Task { await presentShare() }
+          } label: {
+            Label(
+              isPreparingShare ? "Preparing archive…" : "Share capture archive",
+              systemImage: "square.and.arrow.up"
+            )
+            .frame(maxWidth: .infinity)
+          }
+          .buttonStyle(.bordered)
+          .disabled(isPreparingShare)
+
+          Button("Done") {
+            model.returnToSetup()
+          }
+          .buttonStyle(.bordered)
+          .frame(maxWidth: .infinity)
+        }
+        .padding(.horizontal, 24)
+
+        Spacer()
+      }
+      .navigationTitle("Saved")
+      .navigationBarTitleDisplayMode(.inline)
+      .toolbar {
+        ToolbarItem(placement: .topBarTrailing) {
+          NavigationLink {
+            GalleryView(model: model)
+          } label: {
+            Text("Gallery")
+          }
+        }
+      }
+      .sheet(item: $sharePayload) { payload in
+        ActivityView(activityItems: [payload.url])
+      }
+      .alert(
+        "Share failed",
+        isPresented: Binding(
+          get: { shareErrorMessage != nil },
+          set: { if !$0 { shareErrorMessage = nil } }
+        )
+      ) {
+        Button("OK", role: .cancel) {}
+      } message: {
+        Text(shareErrorMessage ?? "")
+      }
+    }
+  }
+
+  @MainActor
+  private func presentShare() async {
+    isPreparingShare = true
+    defer { isPreparingShare = false }
+    do {
+      let url = try await model.makeShareArchive(for: package)
+      sharePayload = SharePayload(url: url)
+    } catch {
+      shareErrorMessage = error.localizedDescription
+    }
+  }
+}
+
 private struct StatusView: View {
   let title: String
   let detail: String
@@ -162,7 +270,7 @@ private struct StatusView: View {
 
 private struct CaptureResultView: View {
   let completion: CaptureCompletion
-  let newCapture: () -> Void
+  let dismiss: () -> Void
 
   var body: some View {
     NavigationStack {
@@ -171,33 +279,29 @@ private struct CaptureResultView: View {
           PanoramaViewer(imageURL: result.panoramaURL)
             .ignoresSafeArea(edges: .bottom)
             .safeAreaInset(edge: .bottom) {
-              Button("New capture", action: newCapture)
+              Button("Done", action: dismiss)
                 .buttonStyle(.borderedProminent)
                 .padding()
             }
         } else {
           VStack(spacing: 18) {
             Spacer()
-            Image(systemName: "checkmark.circle")
+            Image(systemName: "exclamationmark.triangle")
               .font(.system(size: 46))
-              .foregroundStyle(.green)
-            Text("Capture package complete")
+              .foregroundStyle(.orange)
+            Text("Compute unfinished")
               .font(.title2.bold())
-            Text("\(completion.package.manifest.frames.count) full-resolution frames saved")
+            Text("The capture remains in the gallery with all frames and sensor data.")
               .foregroundStyle(.secondary)
+              .multilineTextAlignment(.center)
             if let message = completion.stitchingMessage {
               Text(message)
                 .font(.callout)
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.orange)
             }
-            Text(completion.package.directoryURL.path)
-              .font(.caption.monospaced())
-              .foregroundStyle(.secondary)
-              .textSelection(.enabled)
-              .multilineTextAlignment(.center)
             Spacer()
-            Button("New capture", action: newCapture)
+            Button("Done", action: dismiss)
               .buttonStyle(.borderedProminent)
           }
           .padding()

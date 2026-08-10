@@ -7,11 +7,11 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		000000000000000000000032 /* opencv2.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 000000000000000000000031 /* opencv2.framework */; };
+		000000000000000000000032 /* OpenCV/opencv2.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 000000000000000000000031 /* OpenCV/opencv2.framework */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
-		000000000000000000000031 /* opencv2.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; path = OpenCV/opencv2.framework; sourceTree = "<group>"; };
+		000000000000000000000031 /* OpenCV/opencv2.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; path = OpenCV/opencv2.framework; sourceTree = "<group>"; };
 		000000000000000000000120 /* Sphera.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Sphera.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -27,7 +27,7 @@
 		000000000000000130000000 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			files = (
-				000000000000000000000032 /* opencv2.framework in Frameworks */,
+				000000000000000000000032 /* OpenCV/opencv2.framework in Frameworks */,
 			);
 		};
 /* End PBXFrameworksBuildPhase section */
@@ -42,20 +42,20 @@
 			);
 			sourceTree = "<group>";
 		};
-		000000000000000000000030 /* Vendor */ = {
-			isa = PBXGroup;
-			children = (
-				000000000000000000000031 /* opencv2.framework */,
-			);
-			path = Vendor;
-			sourceTree = "<group>";
-		};
 		000000000000000000000020 /* Products */ = {
 			isa = PBXGroup;
 			children = (
 				000000000000000000000120 /* Sphera.app */,
 			);
 			name = Products;
+			sourceTree = "<group>";
+		};
+		000000000000000000000030 /* Vendor */ = {
+			isa = PBXGroup;
+			children = (
+				000000000000000000000031 /* OpenCV/opencv2.framework */,
+			);
+			path = Vendor;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -309,9 +309,9 @@
 				SUPPORTED_PLATFORMS = iphoneos;
 				SUPPORTS_MACCATALYST = NO;
 				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
-				SWIFT_OBJC_BRIDGING_HEADER = "Sphera/Sphera-Bridging-Header.h";
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OBJC_BRIDGING_HEADER = "Sphera/Sphera-Bridging-Header.h";
 				SWIFT_STRICT_CONCURRENCY = targeted;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
@@ -366,9 +366,9 @@
 				SUPPORTED_PLATFORMS = iphoneos;
 				SUPPORTS_MACCATALYST = NO;
 				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
-				SWIFT_OBJC_BRIDGING_HEADER = "Sphera/Sphera-Bridging-Header.h";
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OBJC_BRIDGING_HEADER = "Sphera/Sphera-Bridging-Header.h";
 				SWIFT_STRICT_CONCURRENCY = targeted;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;

@@ -71,8 +71,7 @@ sphera::CaptureRing captureRing(NSString *value) {
 }
 
 sphera::StitchRequest parseRequest(NSURL *manifestURL,
-                                   NSURL *outputDirectoryURL,
-                                   double maximumPoseRefinementDegrees) {
+                                   NSURL *outputDirectoryURL) {
   NSError *readError = nil;
   NSData *data = [NSData dataWithContentsOfURL:manifestURL
                                        options:0
@@ -115,8 +114,6 @@ sphera::StitchRequest parseRequest(NSURL *manifestURL,
 
   sphera::StitchRequest request;
   request.outputDirectory = fileSystemPath(outputDirectoryURL);
-  request.maximumPoseRefinementDegrees =
-      std::clamp(maximumPoseRefinementDegrees, 0.0, 20.0);
   request.frames.reserve(frames.count);
 
   for (NSUInteger index = 0; index < frames.count; ++index) {
@@ -165,6 +162,13 @@ sphera::StitchRequest parseRequest(NSURL *manifestURL,
         [requiredNumber(target[@"ringCount"],
                         [prefix stringByAppendingString:@".target.ringCount"])
             intValue];
+    input.yawDegrees =
+        [requiredNumber(target[@"yawDegrees"],
+                        [prefix stringByAppendingString:@".target.yawDegrees"])
+            doubleValue];
+    input.pitchDegrees = [requiredNumber(
+        target[@"pitchDegrees"],
+        [prefix stringByAppendingString:@".target.pitchDegrees"]) doubleValue];
     input.exifOrientation =
         [photo[@"exifOrientation"] isKindOfClass:NSNumber.class]
             ? [photo[@"exifOrientation"] intValue]
@@ -205,11 +209,6 @@ sphera::StitchRequest parseRequest(NSURL *manifestURL,
     request.frames.push_back(std::move(input));
   }
 
-  std::sort(
-      request.frames.begin(), request.frames.end(),
-      [](const sphera::FrameInput &left, const sphera::FrameInput &right) {
-        return left.sequenceIndex < right.sequenceIndex;
-      });
   return request;
 }
 
@@ -238,9 +237,8 @@ NSError *nativeError(NSString *description) {
 @implementation SpheraNativeEngineBridge
 
 + (void)stitchManifestAtURL:(NSURL *)manifestURL
-              outputDirectoryURL:(NSURL *)outputDirectoryURL
-    maximumPoseRefinementDegrees:(double)maximumPoseRefinementDegrees
-                      completion:(SpheraNativeStitchCompletion)completion {
+        outputDirectoryURL:(NSURL *)outputDirectoryURL
+                completion:(SpheraNativeStitchCompletion)completion {
   NSURL *manifestCopy = [manifestURL copy];
   NSURL *outputCopy = [outputDirectoryURL copy];
   SpheraNativeStitchCompletion completionCopy = [completion copy];
@@ -250,8 +248,8 @@ NSError *nativeError(NSString *description) {
       SpheraNativeStitchArtifacts *result = nil;
       NSError *error = nil;
       try {
-        sphera::StitchRequest request = parseRequest(
-            manifestCopy, outputCopy, maximumPoseRefinementDegrees);
+        sphera::StitchRequest request =
+            parseRequest(manifestCopy, outputCopy);
         sphera::StitchArtifacts artifacts =
             sphera::PanoramaEngine::stitch(request);
         NSURL *panoramaURL = [NSURL

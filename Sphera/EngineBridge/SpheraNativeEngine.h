@@ -22,10 +22,9 @@ typedef void (^SpheraNativeStitchCompletion)(
 @interface SpheraNativeEngineBridge : NSObject
 
 + (void)stitchManifestAtURL:(NSURL *)manifestURL
-              outputDirectoryURL:(NSURL *)outputDirectoryURL
-    maximumPoseRefinementDegrees:(double)maximumPoseRefinementDegrees
-                      completion:(SpheraNativeStitchCompletion)completion
-    NS_SWIFT_NAME(stitch(manifestURL:outputDirectoryURL:maximumPoseRefinementDegrees:completion:));
+        outputDirectoryURL:(NSURL *)outputDirectoryURL
+                completion:(SpheraNativeStitchCompletion)completion
+    NS_SWIFT_NAME(stitch(manifestURL:outputDirectoryURL:completion:));
 
 @end
 

@@ -388,7 +388,7 @@ func poseMatrixConvention() {
   #expect(simd_distance(serializedForward, expectedForward) < 0.000_000_1)
 }
 
-@Test("Capture packages preserve recorded order and pose-seeded instructions")
+@Test("Capture packages preserve recorded order and estimate-path engine instructions")
 func capturePackagePersistence() async throws {
   let root = FileManager.default.temporaryDirectory
     .appendingPathComponent("SpheraCoreTests-\(UUID().uuidString)", isDirectory: true)
@@ -427,8 +427,9 @@ func capturePackagePersistence() async throws {
       "000_horizontal_01.jpg", "001_horizontal_00.jpg",
     ])
   #expect(package.manifest.engineInitialization.usePosePriors)
-  #expect(!package.manifest.engineInitialization.allowGlobalArrangementRediscovery)
-  #expect(package.manifest.engineInitialization.maximumPoseRefinementDegrees == 8)
+  #expect(package.manifest.engineInitialization.allowGlobalArrangementRediscovery)
+  #expect(package.manifest.engineInitialization.placementSource == "estimate")
+  #expect(package.manifest.engineInitialization.maximumPoseRefinementDegrees == nil)
   #expect(FileManager.default.fileExists(atPath: package.manifestURL.path))
 
   let decoder = JSONDecoder()
@@ -454,7 +455,56 @@ func capturePackagePersistence() async throws {
   #expect(decoded.frames.allSatisfy { $0.lens.deviceType.contains("UltraWide") })
 }
 
-@Test("Engine adapter passes measured rotations and bounded refinement unchanged")
+@Test("Completed packages are listed for the in-app gallery")
+func galleryListsCompletedPackagesOnly() async throws {
+  let root = FileManager.default.temporaryDirectory
+    .appendingPathComponent("SpheraGalleryTests-\(UUID().uuidString)", isDirectory: true)
+  defer { try? FileManager.default.removeItem(at: root) }
+
+  let store = CapturePackageStore(captureSessionsRootURL: root)
+  let completed = try await makeFinalizedPackage(root: root)
+
+  var incompleteConfiguration = CaptureConfiguration.debugPreset
+  incompleteConfiguration.horizontalCount = 2
+  incompleteConfiguration.downwardCount = 0
+  incompleteConfiguration.upwardCount = 0
+  let incompletePlan = CapturePlan(configuration: incompleteConfiguration)
+  _ = try await store.begin(plan: incompletePlan, coreMotionReferenceFrame: "test-frame")
+  // Leave the session incomplete, then abandon it.
+  await store.abandon()
+
+  let listed = try await store.listCompletedPackages()
+  #expect(listed.map(\.manifest.sessionID) == [completed.manifest.sessionID])
+  #expect(listed.first?.manifest.completedAt != nil)
+  #expect(listed.first?.hasPanorama == false)
+}
+
+@Test("Share archive includes images and per-frame metadata")
+func shareArchiveContainsImagesAndMetadata() async throws {
+  let root = FileManager.default.temporaryDirectory
+    .appendingPathComponent("SpheraShareTests-\(UUID().uuidString)", isDirectory: true)
+  defer { try? FileManager.default.removeItem(at: root) }
+
+  let package = try await makeFinalizedPackage(root: root)
+  let zipURL = try await CapturePackageStore(captureSessionsRootURL: root)
+    .makeShareArchive(for: package)
+
+  #expect(zipURL.pathExtension == "zip")
+  #expect(FileManager.default.fileExists(atPath: zipURL.path))
+
+  let zipData = try Data(contentsOf: zipURL)
+  let zipText = String(decoding: zipData, as: UTF8.self)
+  #expect(zipText.contains("manifest.json"))
+  #expect(zipText.contains("images/"))
+  #expect(zipText.contains("metadata/"))
+  #expect(zipText.contains(package.manifest.frames[0].imageFilename))
+
+  let frameSidecar = package.manifest.frames[0].imageFilename
+    .replacingOccurrences(of: ".jpg", with: ".json")
+  #expect(zipText.contains(frameSidecar))
+}
+
+@Test("Engine adapter hands off capture package rotations for pitch-prior metadata")
 func engineHandoff() async throws {
   let root = FileManager.default.temporaryDirectory
     .appendingPathComponent("SpheraEngineTests-\(UUID().uuidString)", isDirectory: true)
@@ -471,7 +521,6 @@ func engineHandoff() async throws {
       == package.manifest.frames.map {
         $0.pose.cameraToCaptureReferenceRotationMatrix
       })
-  #expect(request.maximumPoseRefinementDegrees == 8)
   #expect(request.manifestURL == package.manifestURL)
   #expect(result.panoramaURL == request.outputDirectoryURL.appendingPathComponent("panorama.jpg"))
 }

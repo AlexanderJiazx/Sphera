@@ -29,19 +29,20 @@ struct FrameInput {
   CaptureRing ring = CaptureRing::horizontal;
   int ringIndex = 0;
   int ringCount = 0;
+  double yawDegrees = 0;
+  double pitchDegrees = 0;
   int exifOrientation = 1;
   CameraIntrinsics intrinsics;
 
   /// Row-major rotation mapping display-oriented camera coordinates into the
-  /// gravity-level capture reference frame.
+  /// gravity-level capture reference frame. Used for locked-K pitch prior only;
+  /// arrangement is rediscovered from matches.
   std::array<double, 9> cameraToCaptureReferenceRotation{};
 };
 
 struct StitchRequest {
   std::vector<FrameInput> frames;
   std::filesystem::path outputDirectory;
-  double maximumPoseRefinementDegrees = 8;
-  int outputWidth = 4096;
 };
 
 struct StitchArtifacts {
@@ -49,9 +50,8 @@ struct StitchArtifacts {
   std::filesystem::path reportPath;
 };
 
-/// iOS-native port of the existing Sphera OpenCV stages. The capture pose is
-/// the camera solution's starting point; this engine deliberately has no
-/// global arrangement-estimation entry point.
+/// iOS-native outdoor stitch recipe:
+/// match-based estimate + locked shared intrinsics + CoreMotion ring pitch prior.
 class PanoramaEngine final {
 public:
   static StitchArtifacts stitch(const StitchRequest &request);

@@ -19,6 +19,7 @@ let package = Package(
         "CaptureGuideView.swift",
         "CaptureViewModel.swift",
         "ContentView.swift",
+        "GalleryView.swift",
         "MotionTrackingService.swift",
         "OpenCVSpheraEngine.swift",
         "PanoramaViewer.swift",
@@ -30,6 +31,7 @@ let package = Package(
         "CaptureNavigation.swift",
         "CaptureModels.swift",
         "CapturePackageStore.swift",
+        "CaptureShareArchive.swift",
         "OrientationMath.swift",
         "PanoramaStitching.swift",
       ]

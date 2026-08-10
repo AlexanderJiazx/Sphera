@@ -13,6 +13,7 @@ enum CaptureWorkflowPhase: Equatable {
   case setup
   case preparing
   case capturing
+  case saved(CapturePackage)
   case stitching
   case completed(CaptureCompletion)
   case failed(String)
@@ -32,6 +33,9 @@ final class CaptureViewModel: ObservableObject {
   @Published private(set) var isCapturingPhoto = false
   @Published private(set) var statusMessage = "Ready"
   @Published private(set) var captureErrorMessage: String?
+  @Published private(set) var galleryPackages: [CapturePackage] = []
+  @Published private(set) var galleryErrorMessage: String?
+  @Published private(set) var isRefreshingGallery = false
 
   let motion: MotionTrackingService
   let camera: CameraCaptureService
@@ -121,6 +125,7 @@ final class CaptureViewModel: ObservableObject {
       } catch {
         camera.stop()
         motion.stop()
+        await packageStore.abandon()
         phase = .failed(error.localizedDescription)
         statusMessage = "Capture unavailable"
       }
@@ -128,6 +133,31 @@ final class CaptureViewModel: ObservableObject {
   }
 
   func stopCapture() {
+    camera.stop()
+    motion.stop()
+    isCapturingPhoto = false
+    Task {
+      await packageStore.abandon()
+    }
+    phase = .setup
+    statusMessage = "Ready"
+    captureErrorMessage = nil
+    navigationReading = .unavailable
+    navigationInstruction = .preparing
+    stableHoldProgress = 0
+    alignmentHoldTracker.reset()
+    guidanceState.reset()
+    captureReference = nil
+    currentTargetIndex = 0
+    capturedFrames = []
+    plan = CapturePlan(configuration: configuration)
+  }
+
+  func prepareNewCapture() {
+    stopCapture()
+  }
+
+  func returnToSetup() {
     camera.stop()
     motion.stop()
     isCapturingPhoto = false
@@ -145,8 +175,64 @@ final class CaptureViewModel: ObservableObject {
     plan = CapturePlan(configuration: configuration)
   }
 
-  func prepareNewCapture() {
-    stopCapture()
+  func refreshGallery() async {
+    isRefreshingGallery = true
+    defer { isRefreshingGallery = false }
+    do {
+      galleryPackages = try await packageStore.listCompletedPackages()
+      galleryErrorMessage = nil
+    } catch {
+      galleryErrorMessage = error.localizedDescription
+    }
+  }
+
+  func computeOnDevice(package: CapturePackage, replaceExisting: Bool = false) async {
+    phase = .stitching
+    statusMessage = replaceExisting
+      ? "Recomputing panorama on device"
+      : "Computing panorama on device"
+    camera.stop()
+    motion.stop()
+
+    do {
+      if replaceExisting {
+        try await packageStore.clearEngineOutput(for: package)
+      }
+      let result = try await stitcher.stitch(package: package)
+      phase = .completed(
+        CaptureCompletion(
+          package: package,
+          stitchingResult: result,
+          stitchingMessage: nil
+        )
+      )
+      statusMessage = "Panorama complete"
+      await refreshGallery()
+    } catch {
+      phase = .completed(
+        CaptureCompletion(
+          package: package,
+          stitchingResult: nil,
+          stitchingMessage: error.localizedDescription
+        )
+      )
+      statusMessage = replaceExisting
+        ? "Panorama recompute failed"
+        : "On-device compute failed"
+    }
+  }
+
+  func deleteFromGallery(_ package: CapturePackage) async {
+    do {
+      try await packageStore.deletePackage(package)
+      await refreshGallery()
+    } catch {
+      galleryErrorMessage = error.localizedDescription
+    }
+  }
+
+  func makeShareArchive(for package: CapturePackage) async throws -> URL {
+    try await packageStore.makeShareArchive(for: package)
   }
 
   private func handleMotionSample(_ sample: MotionSample?) {
@@ -258,36 +344,18 @@ final class CaptureViewModel: ObservableObject {
   }
 
   private func finalizeCapture() async {
-    phase = .stitching
-    statusMessage = "Passing pose-initialized capture to Sphera engine"
+    statusMessage = "Saving capture to gallery"
     camera.stop()
     motion.stop()
 
     do {
       let package = try await packageStore.finalize()
-      do {
-        let result = try await stitcher.stitch(package: package)
-        phase = .completed(
-          CaptureCompletion(
-            package: package,
-            stitchingResult: result,
-            stitchingMessage: nil
-          )
-        )
-        statusMessage = "Panorama complete"
-      } catch {
-        phase = .completed(
-          CaptureCompletion(
-            package: package,
-            stitchingResult: nil,
-            stitchingMessage: error.localizedDescription
-          )
-        )
-        statusMessage = "Capture package complete"
-      }
+      phase = .saved(package)
+      statusMessage = "Capture saved"
+      await refreshGallery()
     } catch {
       phase = .failed(error.localizedDescription)
-      statusMessage = "Could not finalize capture package"
+      statusMessage = "Could not save capture package"
     }
   }
 
@@ -332,7 +400,7 @@ extension CaptureMovement {
 extension CaptureWorkflowPhase {
   fileprivate var isTerminal: Bool {
     switch self {
-    case .completed, .failed:
+    case .saved, .completed, .failed:
       true
     default:
       false

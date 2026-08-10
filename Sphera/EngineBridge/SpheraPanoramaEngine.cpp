@@ -15,52 +15,74 @@
 #include <opencv2/stitching/detail/matchers.hpp>
 #include <opencv2/stitching/detail/motion_estimators.hpp>
 #include <opencv2/stitching/detail/seam_finders.hpp>
+#include <opencv2/stitching/detail/util.hpp>
 #include <opencv2/stitching/detail/warpers.hpp>
 #pragma clang diagnostic pop
 
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
-#include <queue>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace sphera {
 namespace {
 
+// Outdoor fullmeta winner (outputs/outdoor_fullmeta_best/report.json).
+constexpr double kWorkMegapixels = 1.0;
+constexpr double kSeamMegapixels = 0.12;
+constexpr int kComposeSourceMaximumDimension = 2000;
+constexpr int kMaximumFeatures = 6000;
+constexpr double kSiftContrastThreshold = 0.005;
+constexpr float kMatchConfidence = 0.3f;
+constexpr float kConfidenceThreshold = 0.12f;
+constexpr int kIntraRingRadius = 1;
+constexpr double kCrossRingTolerance = 0.14; // turns (= 50.4°)
+constexpr double kPitchPriorWeight = 1.0;
+constexpr double kRingSeamOverlapFraction = 0.25;
+constexpr double kBlendStrength = 2.0;
+constexpr double kPeriodicBlendPaddingFraction = 0.08;
+constexpr int kSeamDilateIterations = 1;
 constexpr double kPi = 3.14159265358979323846;
-constexpr double kWorkMegapixels = 0.60;
-constexpr double kSeamMegapixels = 0.10;
-constexpr int kComposeSourceMaximumDimension = 2048;
-constexpr int kMaximumFeatures = 5000;
-constexpr double kMatchGraphConfidence = 0.10;
 
 using cv::detail::CameraParams;
 using cv::detail::ImageFeatures;
 using cv::detail::MatchesInfo;
 
-struct FrameGeometry {
-  CameraIntrinsics intrinsics;
-  double workScale = 1;
-  cv::Mat priorRotation;
-  int featureCount = 0;
-  double appliedPoseCorrectionDegrees = 0;
+struct FrameLayout {
+  int ring = 0;
+  int localIndex = 0;
+  int ringSize = 0;
+  int direction = 1;
+  double phase = 0;
 };
 
-struct RefinementSummary {
-  bool attempted = false;
-  bool applied = false;
-  int approvedPairCount = 0;
-  int confidentPairCount = 0;
-  int rejectedOutlierCount = 0;
-  std::string status = "pose-priors-only";
+struct PreparedFrame {
+  FrameInput input;
+  CameraIntrinsics intrinsics;
+  double workScale = 1;
+  int featureCount = 0;
+  FrameLayout layout;
+};
+
+struct PitchPriorRecord {
+  int index = 0;
+  int ring = 0;
+  double originalPitchDegrees = 0;
+  double priorPitchDegrees = 0;
+  double blendedPitchDegrees = 0;
+  double ringDeltaDegrees = 0;
 };
 
 struct SeamProducts {
   std::vector<cv::UMat> masks;
+  std::vector<cv::Point> corners;
   cv::Ptr<cv::detail::ExposureCompensator> compensator;
   int contributingFrameCount = 0;
   std::string exposureStatus;
   std::string seamStatus;
+  double seamScale = 1;
+  float warperScale = 1;
 };
 
 std::string ringName(CaptureRing ring) {
@@ -78,11 +100,6 @@ void validateRequest(const StitchRequest &request) {
   if (request.frames.size() < 2) {
     throw std::runtime_error(
         "Sphera needs at least two frames to stitch a panorama");
-  }
-  if (request.outputWidth < 1024 || request.outputWidth > 8192 ||
-      request.outputWidth % 2 != 0) {
-    throw std::runtime_error(
-        "The panorama output width must be an even value from 1024 to 8192");
   }
   for (const FrameInput &frame : request.frames) {
     if (!std::filesystem::is_regular_file(frame.imagePath)) {
@@ -122,7 +139,9 @@ cv::Mat orthonormalizedRotation(const cv::Mat &input) {
   return rotation;
 }
 
-cv::Mat openCVRotationFromCapturePose(const FrameInput &frame) {
+cv::Mat iosToOpenCVRotationY180(const FrameInput &frame) {
+  // pose_priors.ios_to_opencv_rotation(..., "y180"): camera-to-world, no
+  // transpose. Used only for the CoreMotion pitch prior.
   cv::Mat captureRotation(3, 3, CV_64F);
   for (int row = 0; row < 3; ++row) {
     for (int column = 0; column < 3; ++column) {
@@ -131,14 +150,8 @@ cv::Mat openCVRotationFromCapturePose(const FrameInput &frame) {
               row * 3 + column)];
     }
   }
-
-  // Capture coordinates use +Y for gravity-up and -Z for the initial heading.
-  // OpenCV's spherical projection uses +Y toward image-down and +Z at the
-  // equirectangular center. A pi rotation about X changes basis without a
-  // reflection and maps the session's first heading to panorama longitude 0.
-  const cv::Matx33d captureToOpenCVValues(1, 0, 0, 0, -1, 0, 0, 0, -1);
-  const cv::Mat captureToOpenCV(captureToOpenCVValues, true);
-  return orthonormalizedRotation(captureToOpenCV * captureRotation);
+  const cv::Matx33d axisFix(-1, 0, 0, 0, 1, 0, 0, 0, -1);
+  return orthonormalizedRotation(captureRotation * cv::Mat(axisFix));
 }
 
 cv::Mat applyExifOrientation(const cv::Mat &encoded, int orientation) {
@@ -199,11 +212,12 @@ double maximumDimensionScale(cv::Size size, int maximumDimension) {
 }
 
 cv::Mat resizedImage(const cv::Mat &source, double scale) {
-  if (std::abs(scale - 1.0) < 0.0001) {
+  if (std::abs(scale - 1.0) < 1e-6) {
     return source;
   }
   cv::Mat resized;
-  cv::resize(source, resized, cv::Size(), scale, scale, cv::INTER_AREA);
+  const int interpolation = scale < 1.0 ? cv::INTER_AREA : cv::INTER_LINEAR;
+  cv::resize(source, resized, cv::Size(), scale, scale, interpolation);
   return resized;
 }
 
@@ -223,78 +237,136 @@ CameraIntrinsics intrinsicsAdjustedToDecodedSize(const FrameInput &frame,
   return adjusted;
 }
 
-cv::Mat intrinsicMatrix(const CameraIntrinsics &intrinsics, double imageScale) {
-  const cv::Matx33f values(static_cast<float>(intrinsics.fx * imageScale), 0,
-                           static_cast<float>(intrinsics.cx * imageScale), 0,
-                           static_cast<float>(intrinsics.fy * imageScale),
-                           static_cast<float>(intrinsics.cy * imageScale), 0, 0,
-                           1);
-  return cv::Mat(values, true);
+double circularDistance(double a, double b) {
+  const double distance = std::abs(a - b);
+  return std::min(distance, 1.0 - distance);
 }
 
-CameraParams cameraAtWorkScale(const FrameGeometry &geometry) {
-  CameraParams camera;
-  camera.focal = geometry.intrinsics.fx * geometry.workScale;
-  camera.aspect = geometry.intrinsics.fy / geometry.intrinsics.fx;
-  camera.ppx = geometry.intrinsics.cx * geometry.workScale;
-  camera.ppy = geometry.intrinsics.cy * geometry.workScale;
-  geometry.priorRotation.convertTo(camera.R, CV_32F);
-  camera.t = cv::Mat::zeros(3, 1, CV_64F);
-  return camera;
-}
-
-cv::Vec3d opticalDirection(const cv::Mat &rotation) {
-  cv::Mat rotation64;
-  rotation.convertTo(rotation64, CV_64F);
-  cv::Vec3d direction(rotation64.at<double>(0, 2), rotation64.at<double>(1, 2),
-                      rotation64.at<double>(2, 2));
-  const double length = cv::norm(direction);
-  return length > 0 ? direction / length : cv::Vec3d(0, 0, 1);
-}
-
-double angularSeparationDegrees(const cv::Mat &left, const cv::Mat &right) {
-  const cv::Vec3d leftDirection = opticalDirection(left);
-  const cv::Vec3d rightDirection = opticalDirection(right);
-  const double cosine =
-      std::clamp(leftDirection.dot(rightDirection), -1.0, 1.0);
-  return std::acos(cosine) * 180.0 / kPi;
-}
-
-bool areCircularNeighbors(const FrameInput &left, const FrameInput &right) {
-  if (left.ring != right.ring || left.ringCount <= 1 ||
-      right.ringCount != left.ringCount) {
-    return false;
+double medianOf(std::vector<double> values) {
+  if (values.empty()) {
+    throw std::runtime_error("Cannot compute median of an empty set");
   }
-  const int direct = std::abs(left.ringIndex - right.ringIndex);
-  const int circular = std::min(direct, left.ringCount - direct);
-  return circular == 1;
+  const std::size_t mid = values.size() / 2;
+  std::nth_element(values.begin(), values.begin() + static_cast<std::ptrdiff_t>(mid),
+                   values.end());
+  if (values.size() % 2 == 1) {
+    return values[mid];
+  }
+  const double upper = values[mid];
+  std::nth_element(values.begin(),
+                   values.begin() + static_cast<std::ptrdiff_t>(mid - 1),
+                   values.end());
+  return 0.5 * (values[mid - 1] + upper);
 }
 
-bool isUpperLowerPair(const FrameInput &left, const FrameInput &right) {
-  return (left.ring == CaptureRing::upward &&
-          right.ring == CaptureRing::downward) ||
-         (left.ring == CaptureRing::downward &&
-          right.ring == CaptureRing::upward);
+int pitchSignForRing(CaptureRing ring) {
+  switch (ring) {
+  case CaptureRing::horizontal:
+    return 0;
+  case CaptureRing::downward:
+    return -1;
+  case CaptureRing::upward:
+    return 1;
+  }
 }
 
-cv::Mat makeTopologyMask(const StitchRequest &request,
-                         const std::vector<FrameGeometry> &geometry,
-                         int &approvedPairCount) {
-  const int count = static_cast<int>(request.frames.size());
+int ringOrderIndex(CaptureRing ring) {
+  switch (ring) {
+  case CaptureRing::horizontal:
+    return 0;
+  case CaptureRing::downward:
+    return 1;
+  case CaptureRing::upward:
+    return 2;
+  }
+}
+
+/// Horizon → downward → upward; within each ring, ascending yaw so direction=+1.
+std::vector<PreparedFrame>
+buildAdaptiveLayout(const std::vector<FrameInput> &frames) {
+  std::vector<CaptureRing> ringOrder = {
+      CaptureRing::horizontal, CaptureRing::downward, CaptureRing::upward};
+  std::unordered_map<int, std::vector<FrameInput>> byRing;
+  for (const FrameInput &frame : frames) {
+    byRing[ringOrderIndex(frame.ring)].push_back(frame);
+  }
+
+  std::vector<PreparedFrame> prepared;
+  prepared.reserve(frames.size());
+  int layoutRing = 0;
+  for (CaptureRing ring : ringOrder) {
+    auto found = byRing.find(ringOrderIndex(ring));
+    if (found == byRing.end() || found->second.empty()) {
+      continue;
+    }
+    std::vector<FrameInput> members = found->second;
+    if (members.size() < 2) {
+      throw std::runtime_error(
+          "Each capture ring must contain at least two images (" +
+          ringName(ring) + ")");
+    }
+    std::sort(members.begin(), members.end(),
+              [](const FrameInput &left, const FrameInput &right) {
+                if (left.yawDegrees != right.yawDegrees) {
+                  return left.yawDegrees < right.yawDegrees;
+                }
+                return left.ringIndex < right.ringIndex;
+              });
+
+    const int ringSize = static_cast<int>(members.size());
+    constexpr int direction = 1;
+    for (int localIndex = 0; localIndex < ringSize; ++localIndex) {
+      PreparedFrame item;
+      item.input = members[static_cast<std::size_t>(localIndex)];
+      item.input.ringIndex = localIndex;
+      item.input.ringCount = ringSize;
+      item.layout.ring = layoutRing;
+      item.layout.localIndex = localIndex;
+      item.layout.ringSize = ringSize;
+      item.layout.direction = direction;
+      item.layout.phase =
+          std::fmod(direction * localIndex / static_cast<double>(ringSize),
+                    1.0);
+      if (item.layout.phase < 0) {
+        item.layout.phase += 1.0;
+      }
+      prepared.push_back(std::move(item));
+    }
+    ++layoutRing;
+  }
+
+  if (prepared.size() != frames.size()) {
+    throw std::runtime_error(
+        "Adaptive ring layout did not retain every captured frame");
+  }
+  return prepared;
+}
+
+cv::Mat buildMatchMask(const std::vector<PreparedFrame> &frames,
+                       int &approvedPairCount) {
+  const int count = static_cast<int>(frames.size());
   cv::Mat mask = cv::Mat::zeros(count, count, CV_8U);
   approvedPairCount = 0;
   for (int left = 0; left < count; ++left) {
     for (int right = left + 1; right < count; ++right) {
-      const bool sameRingNeighbor =
-          areCircularNeighbors(request.frames[left], request.frames[right]);
-      const bool adjacentRingOverlap =
-          request.frames[left].ring != request.frames[right].ring &&
-          !isUpperLowerPair(request.frames[left], request.frames[right]) &&
-          angularSeparationDegrees(geometry[left].priorRotation,
-                                   geometry[right].priorRotation) <= 92.0;
-      if (sameRingNeighbor || adjacentRingOverlap) {
-        mask.at<uchar>(left, right) = 255;
-        mask.at<uchar>(right, left) = 255;
+      const FrameLayout &first = frames[static_cast<std::size_t>(left)].layout;
+      const FrameLayout &second = frames[static_cast<std::size_t>(right)].layout;
+      bool allowed = false;
+      if (first.ring == second.ring) {
+        const int forward =
+            (first.localIndex - second.localIndex + first.ringSize) %
+            first.ringSize;
+        const int backward =
+            (second.localIndex - first.localIndex + first.ringSize) %
+            first.ringSize;
+        allowed = std::min(forward, backward) <= kIntraRingRadius;
+      } else {
+        allowed =
+            circularDistance(first.phase, second.phase) <= kCrossRingTolerance;
+      }
+      if (allowed) {
+        mask.at<uchar>(left, right) = 1;
+        mask.at<uchar>(right, left) = 1;
         ++approvedPairCount;
       }
     }
@@ -302,266 +374,275 @@ cv::Mat makeTopologyMask(const StitchRequest &request,
   return mask;
 }
 
-bool confidentMatchGraphIsConnected(const std::vector<MatchesInfo> &matches,
-                                    int frameCount, int &confidentPairCount) {
-  std::vector<std::vector<int>> adjacency(static_cast<std::size_t>(frameCount));
-  confidentPairCount = 0;
-  for (int left = 0; left < frameCount; ++left) {
-    for (int right = left + 1; right < frameCount; ++right) {
-      const MatchesInfo &match =
-          matches[static_cast<std::size_t>(left * frameCount + right)];
-      if (match.num_inliers >= 8 && match.confidence >= kMatchGraphConfidence) {
-        adjacency[left].push_back(right);
-        adjacency[right].push_back(left);
-        ++confidentPairCount;
-      }
-    }
-  }
-
-  std::vector<bool> visited(static_cast<std::size_t>(frameCount), false);
-  std::queue<int> pending;
-  visited[0] = true;
-  pending.push(0);
-  while (!pending.empty()) {
-    const int current = pending.front();
-    pending.pop();
-    for (int neighbor : adjacency[current]) {
-      if (!visited[neighbor]) {
-        visited[neighbor] = true;
-        pending.push(neighbor);
-      }
-    }
-  }
-  return std::all_of(visited.begin(), visited.end(),
-                     [](bool value) { return value; });
+std::pair<double, double> yawPitchFromRotation(const cv::Mat &rotation) {
+  cv::Mat rotation64;
+  rotation.convertTo(rotation64, CV_64F);
+  const cv::Vec3d forward(rotation64.at<double>(0, 2),
+                          rotation64.at<double>(1, 2),
+                          rotation64.at<double>(2, 2));
+  const double yaw =
+      std::atan2(forward[0], forward[2]) * 180.0 / kPi;
+  const double pitch =
+      std::atan2(-forward[1], std::hypot(forward[0], forward[2])) * 180.0 /
+      kPi;
+  return {yaw, pitch};
 }
 
-cv::Mat clampRotationToPrior(const cv::Mat &candidate, const cv::Mat &prior,
-                             double maximumRadians, double &appliedDegrees) {
-  cv::Mat candidateRotation = orthonormalizedRotation(candidate);
-  cv::Mat priorRotation = orthonormalizedRotation(prior);
-  cv::Mat delta =
-      orthonormalizedRotation(candidateRotation * priorRotation.t());
-  cv::Mat rotationVector;
-  cv::Rodrigues(delta, rotationVector);
-  double angle = cv::norm(rotationVector);
-  if (!std::isfinite(angle)) {
-    appliedDegrees = 0;
-    return priorRotation;
+cv::Mat rotationBetween(const cv::Vec3d &sourceIn, const cv::Vec3d &targetIn) {
+  cv::Vec3d source = sourceIn / std::max(cv::norm(sourceIn), 1e-12);
+  cv::Vec3d target = targetIn / std::max(cv::norm(targetIn), 1e-12);
+  cv::Vec3d cross = source.cross(target);
+  const double sine = cv::norm(cross);
+  const double cosine = std::clamp(source.dot(target), -1.0, 1.0);
+  if (sine < 1e-9) {
+    if (cosine > 0) {
+      return cv::Mat::eye(3, 3, CV_64F);
+    }
+    cv::Vec3d axis = source.cross(cv::Vec3d(1, 0, 0));
+    if (cv::norm(axis) < 1e-6) {
+      axis = source.cross(cv::Vec3d(0, 1, 0));
+    }
+    axis /= cv::norm(axis);
+    cv::Mat matrix;
+    cv::Rodrigues(axis * kPi, matrix);
+    return matrix;
   }
-  if (angle > maximumRadians && angle > 0) {
-    rotationVector *= maximumRadians / angle;
-    angle = maximumRadians;
-  }
-  cv::Mat boundedDelta;
-  cv::Rodrigues(rotationVector, boundedDelta);
-  appliedDegrees = angle * 180.0 / kPi;
-  return orthonormalizedRotation(boundedDelta * priorRotation);
+  cv::Vec3d axis = cross / sine;
+  cv::Mat matrix;
+  cv::Rodrigues(axis * std::atan2(sine, cosine), matrix);
+  return matrix;
 }
 
-std::vector<cv::Mat>
-refinePoses(const StitchRequest &request, std::vector<FrameGeometry> &geometry,
-            const std::vector<ImageFeatures> &features,
-            const std::vector<MatchesInfo> &pairwiseMatches,
-            const std::vector<CameraParams> &priorCameras,
-            RefinementSummary &summary) {
-  std::vector<cv::Mat> rotations;
-  rotations.reserve(geometry.size());
-  for (const FrameGeometry &frame : geometry) {
-    rotations.push_back(frame.priorRotation.clone());
+void applyLockedIntrinsics(std::vector<CameraParams> &cameras,
+                           const std::vector<PreparedFrame> &frames,
+                           bool lockSharedFocal) {
+  std::vector<double> focals;
+  std::vector<double> aspects;
+  focals.reserve(frames.size());
+  aspects.reserve(frames.size());
+  for (const PreparedFrame &frame : frames) {
+    focals.push_back(frame.intrinsics.fx * frame.workScale);
+    aspects.push_back(frame.intrinsics.fy /
+                      std::max(frame.intrinsics.fx, 1e-9));
   }
-
-  if (!confidentMatchGraphIsConnected(pairwiseMatches,
-                                      static_cast<int>(geometry.size()),
-                                      summary.confidentPairCount)) {
-    summary.status = "skipped-disconnected-feature-graph";
-    return rotations;
-  }
-  if (request.maximumPoseRefinementDegrees <= 0) {
-    summary.status = "disabled-by-capture-configuration";
-    return rotations;
-  }
-
-  summary.attempted = true;
-  try {
-    std::vector<CameraParams> candidates = priorCameras;
-    cv::Ptr<cv::detail::BundleAdjusterRay> adjuster =
-        cv::makePtr<cv::detail::BundleAdjusterRay>();
-    adjuster->setConfThresh(kMatchGraphConfidence);
-    adjuster->setRefinementMask(cv::Mat::zeros(3, 3, CV_8U));
-    adjuster->setTermCriteria(cv::TermCriteria(
-        cv::TermCriteria::COUNT | cv::TermCriteria::EPS, 80, 1e-6));
-    if (!(*adjuster)(features, pairwiseMatches, candidates)) {
-      summary.status = "bundle-adjustment-declined";
-      return rotations;
-    }
-
-    // Bundle adjustment has a global rotational gauge. Re-anchor its solution
-    // to the first recorded pose before measuring or limiting any correction.
-    const cv::Mat refinedAnchor = orthonormalizedRotation(candidates[0].R);
-    const cv::Mat priorAnchor =
-        orthonormalizedRotation(geometry[0].priorRotation);
-    const cv::Mat gaugeAlignment = priorAnchor * refinedAnchor.t();
-    const double maximumRadians =
-        request.maximumPoseRefinementDegrees * kPi / 180.0;
-    const double rejectionThresholdRadians =
-        std::max(maximumRadians * 2.0, 12.0 * kPi / 180.0);
-    bool appliedAnyCorrection = false;
-
-    for (std::size_t index = 0; index < candidates.size(); ++index) {
-      const cv::Mat gaugeAligned =
-          gaugeAlignment * orthonormalizedRotation(candidates[index].R);
-      const cv::Mat rawDelta = orthonormalizedRotation(
-          gaugeAligned * geometry[index].priorRotation.t());
-      cv::Mat rawRotationVector;
-      cv::Rodrigues(rawDelta, rawRotationVector);
-      const double rawCorrection = cv::norm(rawRotationVector);
-      if (!std::isfinite(rawCorrection) ||
-          rawCorrection > rejectionThresholdRadians) {
-        ++summary.rejectedOutlierCount;
-        continue;
-      }
-      rotations[index] = clampRotationToPrior(
-          gaugeAligned, geometry[index].priorRotation, maximumRadians,
-          geometry[index].appliedPoseCorrectionDegrees);
-      appliedAnyCorrection =
-          appliedAnyCorrection ||
-          geometry[index].appliedPoseCorrectionDegrees > 0.0001;
-    }
-    summary.applied = appliedAnyCorrection;
-    if (!appliedAnyCorrection && summary.rejectedOutlierCount > 0) {
-      summary.status = "bundle-adjustment-outliers-rejected";
-    } else if (summary.rejectedOutlierCount > 0) {
-      summary.status =
-          "bounded-pose-refinement-applied-with-outlier-rejections";
-    } else {
-      summary.status = "bounded-pose-refinement-applied";
-    }
-  } catch (const cv::Exception &) {
-    summary.status = "bundle-adjustment-failed-using-pose-priors";
-  }
-  return rotations;
-}
-
-void applyRingBandPrior(cv::UMat &mask, cv::Point corner, CaptureRing ring,
-                        int sphereHeight) {
-  double minimumFraction = 0;
-  double maximumFraction = 1;
-  switch (ring) {
-  case CaptureRing::upward:
-    maximumFraction = 0.65;
-    break;
-  case CaptureRing::horizontal:
-    minimumFraction = 0.18;
-    maximumFraction = 0.82;
-    break;
-  case CaptureRing::downward:
-    minimumFraction = 0.35;
-    break;
-  }
-
-  cv::Mat writable = mask.getMat(cv::ACCESS_RW);
-  const int minimumY =
-      static_cast<int>(std::floor(minimumFraction * sphereHeight));
-  const int maximumY =
-      static_cast<int>(std::ceil(maximumFraction * sphereHeight));
-  for (int row = 0; row < writable.rows; ++row) {
-    const int globalY = corner.y + row;
-    if (globalY < minimumY || globalY >= maximumY || globalY < 0 ||
-        globalY >= sphereHeight) {
-      writable.row(row).setTo(0);
-    }
+  const double sharedFocal = lockSharedFocal ? medianOf(focals) : 0;
+  const double sharedAspect = lockSharedFocal ? medianOf(aspects) : 0;
+  for (std::size_t index = 0; index < cameras.size(); ++index) {
+    const PreparedFrame &frame = frames[index];
+    cameras[index].focal =
+        lockSharedFocal ? sharedFocal : focals[index];
+    cameras[index].aspect =
+        lockSharedFocal ? sharedAspect : aspects[index];
+    cameras[index].ppx = frame.intrinsics.cx * frame.workScale;
+    cameras[index].ppy = frame.intrinsics.cy * frame.workScale;
   }
 }
 
-SeamProducts buildSeamsAndExposure(const StitchRequest &request,
-                                   const std::vector<FrameGeometry> &geometry,
-                                   const std::vector<cv::Mat> &rotations) {
-  const int frameCount = static_cast<int>(request.frames.size());
-  constexpr int seamSphereWidth = 1024;
-  constexpr int seamSphereHeight = seamSphereWidth / 2;
-  const float sphereScale = static_cast<float>(seamSphereWidth / (2.0 * kPi));
-  cv::Ptr<cv::detail::RotationWarper> warper =
-      cv::makePtr<cv::detail::SphericalWarper>(sphereScale);
-
-  std::vector<cv::UMat> warpedImages(static_cast<std::size_t>(frameCount));
-  std::vector<cv::UMat> warpedMasks(static_cast<std::size_t>(frameCount));
-  std::vector<cv::Point> corners(static_cast<std::size_t>(frameCount));
-
-  for (int index = 0; index < frameCount; ++index) {
-    cv::Mat fullImage = loadOrientedImage(request.frames[index]);
-    const double seamImageScale =
-        megapixelScale(fullImage.size(), kSeamMegapixels);
-    cv::Mat seamImage = resizedImage(fullImage, seamImageScale);
-    cv::Mat sourceMask(seamImage.size(), CV_8U, cv::Scalar::all(255));
-    const cv::Mat intrinsic =
-        intrinsicMatrix(geometry[index].intrinsics, seamImageScale);
+bool normalizeWorldOrientation(std::vector<CameraParams> &cameras,
+                               const std::vector<PreparedFrame> &frames,
+                               const std::vector<int> &ringPitchSigns) {
+  std::unordered_map<int, std::vector<double>> pitchByRing;
+  for (std::size_t index = 0; index < cameras.size(); ++index) {
+    pitchByRing[frames[index].layout.ring].push_back(
+        yawPitchFromRotation(cameras[index].R).second);
+  }
+  double score = 0;
+  for (const auto &entry : pitchByRing) {
+    if (entry.first < 0 ||
+        entry.first >= static_cast<int>(ringPitchSigns.size())) {
+      throw std::runtime_error("Ring pitch signs must contain one value per ring");
+    }
+    score += ringPitchSigns[static_cast<std::size_t>(entry.first)] *
+             medianOf(entry.second);
+  }
+  if (score >= 0) {
+    return false;
+  }
+  const cv::Matx33d worldRoll(-1, 0, 0, 0, -1, 0, 0, 0, 1);
+  const cv::Mat roll(worldRoll);
+  for (CameraParams &camera : cameras) {
+    cv::Mat rotated = roll * orthonormalizedRotation(camera.R);
     cv::Mat rotation32;
-    rotations[index].convertTo(rotation32, CV_32F);
+    rotated.convertTo(rotation32, CV_32F);
+    camera.R = rotation32;
+  }
+  return true;
+}
 
-    corners[index] =
-        warper->warp(seamImage, intrinsic, rotation32, cv::INTER_LINEAR,
-                     cv::BORDER_REFLECT, warpedImages[index]);
-    warper->warp(sourceMask, intrinsic, rotation32, cv::INTER_NEAREST,
-                 cv::BORDER_CONSTANT, warpedMasks[index]);
-    applyRingBandPrior(warpedMasks[index], corners[index],
-                       request.frames[index].ring, seamSphereHeight);
+std::vector<PitchPriorRecord>
+pullRingPitchesFromMetadata(std::vector<CameraParams> &cameras,
+                            const std::vector<PreparedFrame> &frames,
+                            double weight) {
+  weight = std::clamp(weight, 0.0, 1.0);
+  std::vector<cv::Mat> priorC2W;
+  priorC2W.reserve(frames.size());
+  for (const PreparedFrame &frame : frames) {
+    priorC2W.push_back(iosToOpenCVRotationY180(frame.input));
   }
 
-  SeamProducts products;
-  products.masks.reserve(warpedMasks.size());
-  for (const cv::UMat &mask : warpedMasks) {
-    products.masks.push_back(mask.clone());
+  std::unordered_map<int, std::vector<int>> rings;
+  for (std::size_t index = 0; index < frames.size(); ++index) {
+    rings[frames[index].layout.ring].push_back(static_cast<int>(index));
   }
 
-  products.compensator = cv::detail::ExposureCompensator::createDefault(
-      cv::detail::ExposureCompensator::GAIN_BLOCKS);
-  try {
-    products.compensator->feed(corners, warpedImages, warpedMasks);
-    products.exposureStatus = "gain-blocks";
-  } catch (const cv::Exception &) {
-    products.compensator = cv::makePtr<cv::detail::NoExposureCompensator>();
-    products.exposureStatus = "disabled-after-open-cv-error";
-  }
-
-  std::vector<cv::UMat> floatingImages(warpedImages.size());
-  for (std::size_t index = 0; index < warpedImages.size(); ++index) {
-    warpedImages[index].convertTo(floatingImages[index], CV_32F);
-  }
-
-  try {
-    cv::detail::GraphCutSeamFinder seamFinder(
-        cv::detail::GraphCutSeamFinderBase::COST_COLOR_GRAD);
-    seamFinder.find(floatingImages, corners, products.masks);
-    int contributingFrames = 0;
-    for (const cv::UMat &mask : products.masks) {
-      contributingFrames += cv::countNonZero(mask) > 0 ? 1 : 0;
+  std::vector<PitchPriorRecord> records;
+  for (const auto &entry : rings) {
+    const std::vector<int> &indices = entry.second;
+    std::vector<double> estimated;
+    std::vector<double> priorPitches;
+    estimated.reserve(indices.size());
+    priorPitches.reserve(indices.size());
+    for (int index : indices) {
+      estimated.push_back(yawPitchFromRotation(cameras[static_cast<std::size_t>(index)].R)
+                              .second);
+      priorPitches.push_back(
+          yawPitchFromRotation(priorC2W[static_cast<std::size_t>(index)]).second);
     }
-    if (contributingFrames == 0) {
-      products.masks.clear();
-      for (const cv::UMat &mask : warpedMasks) {
-        products.masks.push_back(mask.clone());
+
+    double priorMedian = medianOf(priorPitches);
+    const double estimatedMedian = medianOf(estimated);
+    if (estimatedMedian * priorMedian < 0 && std::abs(estimatedMedian) > 5 &&
+        std::abs(priorMedian) > 5) {
+      priorMedian = -priorMedian;
+      for (double &value : priorPitches) {
+        value = -value;
       }
-      products.contributingFrameCount = static_cast<int>(std::count_if(
-          warpedMasks.begin(), warpedMasks.end(),
-          [](const cv::UMat &mask) { return cv::countNonZero(mask) > 0; }));
-      products.seamStatus = "ring-prior-fallback-after-empty-graphcut-result";
-    } else {
-      products.contributingFrameCount = contributingFrames;
-      products.seamStatus = "graphcut-color-gradient-with-ring-priors";
     }
-  } catch (const cv::Exception &) {
-    products.masks.clear();
-    for (const cv::UMat &mask : warpedMasks) {
-      products.masks.push_back(mask.clone());
+
+    const double targetMedian =
+        estimatedMedian * (1.0 - weight) + priorMedian * weight;
+    const double delta = targetMedian - estimatedMedian;
+
+    for (std::size_t local = 0; local < indices.size(); ++local) {
+      const int index = indices[local];
+      CameraParams &camera = cameras[static_cast<std::size_t>(index)];
+      const auto [ey, ep] = yawPitchFromRotation(camera.R);
+      const double framePrior = priorPitches[local];
+      const double desired =
+          ep + delta * weight + (framePrior - priorMedian) * weight * 0.35;
+      const double eyRad = ey * kPi / 180.0;
+      const double desiredRad = desired * kPi / 180.0;
+      const cv::Vec3d desiredForward(
+          std::sin(eyRad) * std::cos(desiredRad), -std::sin(desiredRad),
+          std::cos(eyRad) * std::cos(desiredRad));
+      cv::Mat rotation64;
+      camera.R.convertTo(rotation64, CV_64F);
+      const cv::Vec3d currentForward(rotation64.at<double>(0, 2),
+                                     rotation64.at<double>(1, 2),
+                                     rotation64.at<double>(2, 2));
+      const cv::Mat alignment = rotationBetween(currentForward, desiredForward);
+      cv::Mat updated;
+      orthonormalizedRotation(alignment * rotation64)
+          .convertTo(updated, CV_32F);
+      camera.R = updated;
+
+      PitchPriorRecord record;
+      record.index = index;
+      record.ring = entry.first;
+      record.originalPitchDegrees = ep;
+      record.priorPitchDegrees = framePrior;
+      record.blendedPitchDegrees = desired;
+      record.ringDeltaDegrees = delta;
+      records.push_back(record);
     }
-    products.contributingFrameCount = static_cast<int>(std::count_if(
-        warpedMasks.begin(), warpedMasks.end(),
-        [](const cv::UMat &mask) { return cv::countNonZero(mask) > 0; }));
-    products.seamStatus = "ring-prior-fallback-after-open-cv-error";
+  }
+  return records;
+}
+
+cv::Mat scaledCameraK(const CameraParams &camera, double aspectScale) {
+  cv::Mat intrinsic = camera.K();
+  intrinsic.convertTo(intrinsic, CV_32F);
+  intrinsic.at<float>(0, 0) *= static_cast<float>(aspectScale);
+  intrinsic.at<float>(0, 2) *= static_cast<float>(aspectScale);
+  intrinsic.at<float>(1, 1) *= static_cast<float>(aspectScale);
+  intrinsic.at<float>(1, 2) *= static_cast<float>(aspectScale);
+  return intrinsic;
+}
+
+void applyRingBandPriors(std::vector<cv::UMat> &masks,
+                         const std::vector<cv::Point> &corners,
+                         const std::vector<PreparedFrame> &frames,
+                         double overlapFraction) {
+  std::unordered_map<int, std::vector<double>> centersByRing;
+  for (std::size_t index = 0; index < masks.size(); ++index) {
+    cv::Mat mask = masks[index].getMat(cv::ACCESS_READ);
+    std::vector<cv::Point> nonzero;
+    cv::findNonZero(mask, nonzero);
+    if (nonzero.empty()) {
+      continue;
+    }
+    std::vector<int> rows;
+    rows.reserve(nonzero.size());
+    for (const cv::Point &point : nonzero) {
+      rows.push_back(point.y);
+    }
+    std::nth_element(rows.begin(), rows.begin() + rows.size() / 2, rows.end());
+    centersByRing[frames[index].layout.ring].push_back(
+        corners[index].y + rows[rows.size() / 2]);
+  }
+  if (centersByRing.size() < 2) {
+    return;
   }
 
-  return products;
+  std::unordered_map<int, double> ringCenters;
+  for (auto &entry : centersByRing) {
+    ringCenters[entry.first] = medianOf(entry.second);
+  }
+  std::vector<int> ordered;
+  ordered.reserve(ringCenters.size());
+  for (const auto &entry : ringCenters) {
+    ordered.push_back(entry.first);
+  }
+  std::sort(ordered.begin(), ordered.end(),
+            [&](int left, int right) {
+              return ringCenters[left] < ringCenters[right];
+            });
+
+  std::unordered_map<int, double> lowerBounds;
+  std::unordered_map<int, double> upperBounds;
+  for (int ring : ordered) {
+    lowerBounds[ring] = -1e300;
+    upperBounds[ring] = 1e300;
+  }
+  for (std::size_t index = 0; index + 1 < ordered.size(); ++index) {
+    const int first = ordered[index];
+    const int second = ordered[index + 1];
+    const double firstCenter = ringCenters[first];
+    const double secondCenter = ringCenters[second];
+    const double gap = secondCenter - firstCenter;
+    const double midpoint = 0.5 * (firstCenter + secondCenter);
+    const double halfOverlap = gap * overlapFraction / 2.0;
+    upperBounds[first] = midpoint + halfOverlap;
+    lowerBounds[second] = midpoint - halfOverlap;
+  }
+
+  for (std::size_t index = 0; index < masks.size(); ++index) {
+    const int ring = frames[index].layout.ring;
+    cv::Mat writable = masks[index].getMat(cv::ACCESS_RW);
+    for (int row = 0; row < writable.rows; ++row) {
+      const double globalY = corners[index].y + row;
+      if (globalY < lowerBounds[ring] || globalY > upperBounds[ring]) {
+        writable.row(row).setTo(0);
+      }
+    }
+  }
+}
+
+cv::Mat transferSeamMask(const cv::Mat &seamMask, cv::Point seamCorner,
+                         cv::Point composeCorner, cv::Size composeSize,
+                         double scaleRatio, int dilationIterations) {
+  cv::Mat expanded;
+  cv::dilate(seamMask, expanded, cv::Mat(), cv::Point(-1, -1),
+             std::max(0, dilationIterations));
+  cv::Mat transform = cv::Mat::zeros(2, 3, CV_64F);
+  transform.at<double>(0, 0) = scaleRatio;
+  transform.at<double>(0, 2) = seamCorner.x * scaleRatio - composeCorner.x;
+  transform.at<double>(1, 1) = scaleRatio;
+  transform.at<double>(1, 2) = seamCorner.y * scaleRatio - composeCorner.y;
+  cv::Mat transferred;
+  cv::warpAffine(expanded, transferred, transform, composeSize, cv::INTER_NEAREST,
+                 cv::BORDER_CONSTANT, cv::Scalar(0));
+  return transferred;
 }
 
 bool feedPeriodicImage(cv::detail::Blender &blender, const cv::Mat &image,
@@ -616,35 +697,161 @@ void makeLongitudeBoundaryContinuous(cv::Mat &panorama, cv::Mat &mask) {
   }
 }
 
-std::filesystem::path composePanorama(
-    const StitchRequest &request, const std::vector<FrameGeometry> &geometry,
-    const std::vector<cv::Mat> &rotations, const SeamProducts &seams) {
-  const int sphereWidth = request.outputWidth;
-  const int sphereHeight = sphereWidth / 2;
-  const int sphereLeft = -sphereWidth / 2;
-  const int periodicPadding = std::max(64, sphereWidth / 32);
-  const cv::Rect paddedDestination(sphereLeft - periodicPadding, 0,
-                                   sphereWidth + periodicPadding * 2,
-                                   sphereHeight);
-  const float sphereScale = static_cast<float>(sphereWidth / (2.0 * kPi));
+SeamProducts buildSeamsAndExposure(const std::vector<PreparedFrame> &frames,
+                                   const std::vector<CameraParams> &cameras,
+                                   float warperScaleWork, double workScale,
+                                   double seamScale) {
+  const int frameCount = static_cast<int>(frames.size());
+  const double seamWorkAspect = seamScale / workScale;
+  const float seamWarperScale =
+      static_cast<float>(warperScaleWork * seamWorkAspect);
   cv::Ptr<cv::detail::RotationWarper> warper =
-      cv::makePtr<cv::detail::SphericalWarper>(sphereScale);
+      cv::makePtr<cv::detail::SphericalWarper>(seamWarperScale);
 
-  cv::detail::MultiBandBlender blender(false, 5, CV_32F);
-  blender.setNumBands(5);
-  blender.prepare(paddedDestination);
+  std::vector<cv::UMat> warpedImages(static_cast<std::size_t>(frameCount));
+  std::vector<cv::UMat> warpedMasks(static_cast<std::size_t>(frameCount));
+  std::vector<cv::Point> corners(static_cast<std::size_t>(frameCount));
+
+  for (int index = 0; index < frameCount; ++index) {
+    cv::Mat fullImage = loadOrientedImage(frames[static_cast<std::size_t>(index)].input);
+    cv::Mat seamImage = resizedImage(fullImage, seamScale);
+    cv::Mat sourceMask(seamImage.size(), CV_8U, cv::Scalar::all(255));
+    const cv::Mat intrinsic =
+        scaledCameraK(cameras[static_cast<std::size_t>(index)], seamWorkAspect);
+    cv::Mat rotation32;
+    cameras[static_cast<std::size_t>(index)].R.convertTo(rotation32, CV_32F);
+
+    corners[static_cast<std::size_t>(index)] = warper->warp(
+        seamImage, intrinsic, rotation32, cv::INTER_LINEAR, cv::BORDER_REFLECT,
+        warpedImages[static_cast<std::size_t>(index)]);
+    warper->warp(sourceMask, intrinsic, rotation32, cv::INTER_NEAREST,
+                 cv::BORDER_CONSTANT,
+                 warpedMasks[static_cast<std::size_t>(index)]);
+  }
+
+  applyRingBandPriors(warpedMasks, corners, frames, kRingSeamOverlapFraction);
+
+  SeamProducts products;
+  products.corners = corners;
+  products.seamScale = seamScale;
+  products.warperScale = seamWarperScale;
+  products.masks.reserve(warpedMasks.size());
+  for (const cv::UMat &mask : warpedMasks) {
+    products.masks.push_back(mask.clone());
+  }
+
+  products.compensator = cv::detail::ExposureCompensator::createDefault(
+      cv::detail::ExposureCompensator::GAIN_BLOCKS);
+  try {
+    products.compensator->feed(corners, warpedImages, products.masks);
+    products.exposureStatus = "gain-blocks";
+  } catch (const cv::Exception &) {
+    products.compensator = cv::makePtr<cv::detail::NoExposureCompensator>();
+    products.exposureStatus = "disabled-after-open-cv-error";
+  }
+
+  // Winner uses graph-cut on RAW warped images (not exposure-compensated).
+  std::vector<cv::UMat> floatingImages(warpedImages.size());
+  for (std::size_t index = 0; index < warpedImages.size(); ++index) {
+    warpedImages[index].convertTo(floatingImages[index], CV_32F);
+  }
+
+  try {
+    cv::detail::GraphCutSeamFinder seamFinder(
+        cv::detail::GraphCutSeamFinderBase::COST_COLOR_GRAD);
+    seamFinder.find(floatingImages, corners, products.masks);
+    int contributingFrames = 0;
+    for (const cv::UMat &mask : products.masks) {
+      contributingFrames += cv::countNonZero(mask) > 0 ? 1 : 0;
+    }
+    if (contributingFrames == 0) {
+      products.masks.clear();
+      for (const cv::UMat &mask : warpedMasks) {
+        products.masks.push_back(mask.clone());
+      }
+      products.contributingFrameCount = static_cast<int>(std::count_if(
+          warpedMasks.begin(), warpedMasks.end(),
+          [](const cv::UMat &mask) { return cv::countNonZero(mask) > 0; }));
+      products.seamStatus = "ring-prior-fallback-after-empty-graphcut-result";
+    } else {
+      products.contributingFrameCount = contributingFrames;
+      products.seamStatus = "graphcut-color-gradient-with-ring-priors";
+    }
+  } catch (const cv::Exception &) {
+    products.masks.clear();
+    for (const cv::UMat &mask : warpedMasks) {
+      products.masks.push_back(mask.clone());
+    }
+    products.contributingFrameCount = static_cast<int>(std::count_if(
+        warpedMasks.begin(), warpedMasks.end(),
+        [](const cv::UMat &mask) { return cv::countNonZero(mask) > 0; }));
+    products.seamStatus = "ring-prior-fallback-after-open-cv-error";
+  }
+
+  return products;
+}
+
+std::filesystem::path composePanorama(
+    const std::vector<PreparedFrame> &frames,
+    const std::vector<CameraParams> &cameras, const SeamProducts &seams,
+    float warperScaleWork, double workScale, double composeScale,
+    const std::filesystem::path &outputDirectory) {
+  const double composeWorkAspect = composeScale / workScale;
+  const float composeWarperScale =
+      static_cast<float>(warperScaleWork * composeWorkAspect);
+  cv::Ptr<cv::detail::RotationWarper> warper =
+      cv::makePtr<cv::detail::SphericalWarper>(composeWarperScale);
+
+  std::vector<cv::Point> composeCorners(frames.size());
+  std::vector<cv::Size> composeSizes(frames.size());
+  for (std::size_t index = 0; index < frames.size(); ++index) {
+    const cv::Size scaledSize(
+        static_cast<int>(std::lround(frames[index].intrinsics.referenceWidth *
+                                     composeScale)),
+        static_cast<int>(std::lround(frames[index].intrinsics.referenceHeight *
+                                     composeScale)));
+    const cv::Mat intrinsic = scaledCameraK(cameras[index], composeWorkAspect);
+    cv::Mat rotation32;
+    cameras[index].R.convertTo(rotation32, CV_32F);
+    const cv::Rect roi = warper->warpRoi(scaledSize, intrinsic, rotation32);
+    composeCorners[index] = roi.tl();
+    composeSizes[index] = roi.size();
+  }
+
+  const cv::Rect geometricRoi =
+      cv::detail::resultRoi(composeCorners, composeSizes);
+  const int sphereWidth =
+      static_cast<int>(std::lround(2.0 * kPi * composeWarperScale));
+  const int sphereHeight =
+      static_cast<int>(std::lround(kPi * composeWarperScale));
+  const int sphereLeft =
+      static_cast<int>(std::lround(-kPi * composeWarperScale));
+  const cv::Rect composeRoi(sphereLeft, geometricRoi.y, sphereWidth,
+                            geometricRoi.height);
+  const int periodicPadding = static_cast<int>(
+      std::lround(sphereWidth * kPeriodicBlendPaddingFraction));
+  const cv::Rect blenderRoi(composeRoi.x - periodicPadding, composeRoi.y,
+                            composeRoi.width + 2 * periodicPadding,
+                            composeRoi.height);
+
+  const double blendWidth =
+      std::sqrt(static_cast<double>(blenderRoi.width) * blenderRoi.height) *
+      kBlendStrength / 100.0;
+  const int blendNumBands =
+      std::max(1, static_cast<int>(std::log2(std::max(2.0, blendWidth)) - 1.0));
+
+  cv::detail::MultiBandBlender blender(false, blendNumBands);
+  blender.setNumBands(blendNumBands);
+  blender.prepare(blenderRoi);
   int feedCount = 0;
 
-  for (std::size_t index = 0; index < request.frames.size(); ++index) {
-    cv::Mat fullImage = loadOrientedImage(request.frames[index]);
-    const double imageScale =
-        maximumDimensionScale(fullImage.size(), kComposeSourceMaximumDimension);
-    cv::Mat image = resizedImage(fullImage, imageScale);
+  for (std::size_t index = 0; index < frames.size(); ++index) {
+    cv::Mat fullImage = loadOrientedImage(frames[index].input);
+    cv::Mat image = resizedImage(fullImage, composeScale);
     cv::Mat sourceMask(image.size(), CV_8U, cv::Scalar::all(255));
-    const cv::Mat intrinsic =
-        intrinsicMatrix(geometry[index].intrinsics, imageScale);
+    const cv::Mat intrinsic = scaledCameraK(cameras[index], composeWorkAspect);
     cv::Mat rotation32;
-    rotations[index].convertTo(rotation32, CV_32F);
+    cameras[index].R.convertTo(rotation32, CV_32F);
 
     cv::Mat warpedImage;
     cv::Mat warpedMask;
@@ -656,23 +863,20 @@ std::filesystem::path composePanorama(
     seams.compensator->apply(static_cast<int>(index), corner, warpedImage,
                              warpedMask);
 
-    cv::Mat dilatedSeam;
-    cv::dilate(seams.masks[index].getMat(cv::ACCESS_READ), dilatedSeam,
-               cv::Mat(), cv::Point(-1, -1), 1);
-    cv::Mat transferredSeam;
-    cv::resize(dilatedSeam, transferredSeam, warpedMask.size(), 0, 0,
-               cv::INTER_LINEAR);
-    cv::threshold(transferredSeam, transferredSeam, 0, 255, cv::THRESH_BINARY);
+    const cv::Mat seamMask = transferSeamMask(
+        seams.masks[index].getMat(cv::ACCESS_READ), seams.corners[index],
+        corner, warpedMask.size(), composeScale / seams.seamScale,
+        kSeamDilateIterations);
     cv::Mat selectedMask;
-    cv::bitwise_and(warpedMask, transferredSeam, selectedMask);
+    cv::bitwise_and(warpedMask, seamMask, selectedMask);
     if (cv::countNonZero(selectedMask) == 0) {
       continue;
     }
 
     cv::Mat warped16;
     warpedImage.convertTo(warped16, CV_16S);
-    if (feedPeriodicImage(blender, warped16, selectedMask, corner,
-                          paddedDestination, sphereWidth)) {
+    if (feedPeriodicImage(blender, warped16, selectedMask, corner, blenderRoi,
+                          sphereWidth)) {
       ++feedCount;
     }
   }
@@ -690,14 +894,15 @@ std::filesystem::path composePanorama(
         "OpenCV returned an empty panorama after blending");
   }
 
-  const cv::Rect centralRegion(
-      periodicPadding, 0, std::min(sphereWidth, blended.cols - periodicPadding),
-      std::min(sphereHeight, blended.rows));
-  if (centralRegion.width != sphereWidth ||
-      centralRegion.height != sphereHeight) {
+  const int availableWidth =
+      std::max(0, blended.cols - periodicPadding);
+  const int cropWidth = std::min(sphereWidth, availableWidth);
+  const int cropHeight = std::min(sphereHeight, blended.rows);
+  if (cropWidth <= 0 || cropHeight <= 0) {
     throw std::runtime_error(
-        "The blended panorama did not have the requested 2:1 dimensions");
+        "The blended panorama did not have a usable equirectangular crop");
   }
+  const cv::Rect centralRegion(periodicPadding, 0, cropWidth, cropHeight);
 
   cv::Mat panorama16 = blended(centralRegion).clone();
   cv::Mat panoramaMask = blendedMask(centralRegion).clone();
@@ -706,61 +911,130 @@ std::filesystem::path composePanorama(
   panorama.setTo(cv::Scalar::all(0), panoramaMask == 0);
   makeLongitudeBoundaryContinuous(panorama, panoramaMask);
 
+  // Full 2:1 equirectangular canvas when geometric ROI is shorter than π.
+  cv::Mat equirectangular(sphereHeight, sphereWidth, CV_8UC3, cv::Scalar::all(0));
+  cv::Mat equirectangularMask(sphereHeight, sphereWidth, CV_8U,
+                              cv::Scalar::all(0));
+  const int dstY = std::clamp(composeRoi.y, 0, std::max(0, sphereHeight - 1));
+  const int copyHeight =
+      std::min(panorama.rows, sphereHeight - dstY);
+  if (copyHeight > 0) {
+    panorama(cv::Rect(0, 0, panorama.cols, copyHeight))
+        .copyTo(equirectangular(cv::Rect(0, dstY, panorama.cols, copyHeight)));
+    panoramaMask(cv::Rect(0, 0, panoramaMask.cols, copyHeight))
+        .copyTo(
+            equirectangularMask(cv::Rect(0, dstY, panoramaMask.cols, copyHeight)));
+  }
+  makeLongitudeBoundaryContinuous(equirectangular, equirectangularMask);
+
   const std::filesystem::path panoramaPath =
-      request.outputDirectory / "panorama_equirectangular.jpg";
-  if (!cv::imwrite(panoramaPath.string(), panorama,
+      outputDirectory / "panorama_equirectangular.jpg";
+  if (!cv::imwrite(panoramaPath.string(), equirectangular,
                    {cv::IMWRITE_JPEG_QUALITY, 95})) {
     throw std::runtime_error("Could not write the equirectangular panorama");
   }
   return panoramaPath;
 }
 
-void writeReport(const StitchRequest &request,
-                 const std::vector<FrameGeometry> &geometry,
-                 const RefinementSummary &refinement, const SeamProducts &seams,
+void writeReport(const std::vector<PreparedFrame> &frames,
+                 const std::vector<int> &ringSizes,
+                 const std::vector<int> &ringDirections,
+                 const std::vector<int> &ringPitchSigns, int approvedPairCount,
+                 bool orientationFlipped,
+                 const std::vector<PitchPriorRecord> &pitchRecords,
+                 const SeamProducts &seams,
                  const std::filesystem::path &panoramaPath,
                  const std::filesystem::path &reportPath,
-                 double elapsedSeconds) {
+                 double elapsedSeconds, double workScale, double seamScale,
+                 double composeScale) {
   cv::FileStorage report(reportPath.string(),
                          cv::FileStorage::WRITE | cv::FileStorage::FORMAT_JSON);
   if (!report.isOpened()) {
     throw std::runtime_error("Could not create the native engine report");
   }
 
-  double maximumAppliedCorrection = 0;
-  for (const FrameGeometry &frame : geometry) {
-    maximumAppliedCorrection =
-        std::max(maximumAppliedCorrection, frame.appliedPoseCorrectionDegrees);
-  }
-
   report << "engine" << "sphera-ios-native";
-  report << "engine_contract_version" << 1;
+  report << "engine_contract_version" << 2;
   report << "opencv_version" << CV_VERSION;
   report << "status" << "success";
   report << "elapsed_seconds" << elapsedSeconds;
-  report << "initial_layout" << "{";
-  report << "source" << "frames[].pose.cameraToCaptureReferenceRotationMatrix";
-  report << "global_arrangement_rediscovery" << false;
-  report << "coordinate_conversion"
-         << "capture gravity-up frame to OpenCV spherical frame by pi rotation "
-            "about X";
+  report << "recipe" << "outdoor_fullmeta_best";
+
+  report << "configuration" << "{";
+  report << "work_megapix" << kWorkMegapixels;
+  report << "seam_megapix" << kSeamMegapixels;
+  report << "compose_max_dimension" << kComposeSourceMaximumDimension;
+  report << "work_scale" << workScale;
+  report << "seam_scale" << seamScale;
+  report << "compose_scale" << composeScale;
+  report << "match_confidence" << kMatchConfidence;
+  report << "confidence_threshold" << kConfidenceThreshold;
+  report << "intra_ring_radius" << kIntraRingRadius;
+  report << "cross_ring_tolerance" << kCrossRingTolerance;
+  report << "ring_sizes" << "[";
+  for (int size : ringSizes) {
+    report << size;
+  }
+  report << "]";
+  report << "ring_directions" << "[";
+  for (int direction : ringDirections) {
+    report << direction;
+  }
+  report << "]";
+  report << "ring_pitch_signs" << "[";
+  for (int sign : ringPitchSigns) {
+    report << sign;
+  }
+  report << "]";
+  report << "pose_placement" << "estimate";
+  report << "lock_intrinsics" << true;
+  report << "lock_shared_focal" << true;
+  report << "bundle_adjust" << true;
+  report << "ba_refine_intrinsics" << false;
+  report << "wave_correct" << true;
+  report << "normalize_world_orientation" << true;
+  report << "pose_outlier_regularization" << false;
+  report << "pitch_prior_weight" << kPitchPriorWeight;
+  report << "learned_match_mode" << "unavailable";
+  report << "seam_finder" << "graphcut";
+  report << "ring_seam_prior" << true;
+  report << "ring_seam_overlap_fraction" << kRingSeamOverlapFraction;
+  report << "blend_strength" << kBlendStrength;
+  report << "periodic_blend_padding_fraction" << kPeriodicBlendPaddingFraction;
   report << "}";
-  report << "pose_refinement" << "{";
-  report << "status" << refinement.status;
-  report << "attempted" << refinement.attempted;
-  report << "applied" << refinement.applied;
-  report << "maximum_allowed_degrees" << request.maximumPoseRefinementDegrees;
-  report << "maximum_applied_degrees" << maximumAppliedCorrection;
-  report << "approved_topology_pair_count" << refinement.approvedPairCount;
-  report << "confident_pair_count" << refinement.confidentPairCount;
-  report << "rejected_outlier_count" << refinement.rejectedOutlierCount;
+
+  report << "camera_estimation" << "{";
+  report << "seed" << "homography-estimator";
+  report << "global_arrangement_rediscovery" << true;
+  report << "orientation_flipped" << orientationFlipped;
+  report << "approved_topology_pair_count" << approvedPairCount;
+  report << "pitch_prior_adjustments" << "[";
+  for (const PitchPriorRecord &record : pitchRecords) {
+    report << "{";
+    report << "index" << record.index;
+    report << "ring" << record.ring;
+    report << "original_pitch_degrees" << record.originalPitchDegrees;
+    report << "prior_pitch_degrees" << record.priorPitchDegrees;
+    report << "blended_pitch_degrees" << record.blendedPitchDegrees;
+    report << "ring_delta_degrees" << record.ringDeltaDegrees;
+    report << "}";
+  }
+  report << "]";
   report << "}";
+
   report << "pipeline" << "["
-         << "pose-initialized-layout"
+         << "adaptive-ring-layout"
          << "sift-feature-matching"
-         << "topology-masked-edge-alignment"
-         << "bounded-ray-bundle-adjustment"
+         << "topology-masked-pairs"
+         << "homography-camera-estimate"
+         << "locked-shared-intrinsics"
+         << "ray-bundle-adjustment-rotations"
+         << "wave-correct"
+         << "normalize-world-orientation"
+         << "coremotion-ring-pitch-prior"
+         << "relock-intrinsics"
          << "spherical-warp"
+         << "ring-seam-priors"
          << "gain-block-exposure-correction"
          << "graphcut-seam-optimization"
          << "periodic-multiband-blending"
@@ -770,25 +1044,25 @@ void writeReport(const StitchRequest &request,
   report << "seam_contributing_frame_count" << seams.contributingFrameCount;
   report << "output" << "{";
   report << "panorama_equirectangular" << panoramaPath.string();
-  report << "width" << request.outputWidth;
-  report << "height" << request.outputWidth / 2;
   report << "}";
   report << "frames" << "[";
-  for (std::size_t index = 0; index < request.frames.size(); ++index) {
+  for (std::size_t index = 0; index < frames.size(); ++index) {
     report << "{";
-    report << "sequence_index" << request.frames[index].sequenceIndex;
-    report << "image" << request.frames[index].imageFilename;
-    report << "ring" << ringName(request.frames[index].ring);
-    report << "feature_count" << geometry[index].featureCount;
-    report << "pose_correction_degrees"
-           << geometry[index].appliedPoseCorrectionDegrees;
+    report << "sequence_index" << frames[index].input.sequenceIndex;
+    report << "image" << frames[index].input.imageFilename;
+    report << "ring" << ringName(frames[index].input.ring);
+    report << "layout_ring" << frames[index].layout.ring;
+    report << "layout_local_index" << frames[index].layout.localIndex;
+    report << "layout_phase" << frames[index].layout.phase;
+    report << "yaw_degrees" << frames[index].input.yawDegrees;
+    report << "feature_count" << frames[index].featureCount;
     report << "intrinsics" << "{";
-    report << "fx" << geometry[index].intrinsics.fx;
-    report << "fy" << geometry[index].intrinsics.fy;
-    report << "cx" << geometry[index].intrinsics.cx;
-    report << "cy" << geometry[index].intrinsics.cy;
-    report << "reference_width" << geometry[index].intrinsics.referenceWidth;
-    report << "reference_height" << geometry[index].intrinsics.referenceHeight;
+    report << "fx" << frames[index].intrinsics.fx;
+    report << "fy" << frames[index].intrinsics.fy;
+    report << "cx" << frames[index].intrinsics.cx;
+    report << "cy" << frames[index].intrinsics.cy;
+    report << "reference_width" << frames[index].intrinsics.referenceWidth;
+    report << "reference_height" << frames[index].intrinsics.referenceHeight;
     report << "}";
     report << "}";
   }
@@ -803,57 +1077,131 @@ StitchArtifacts PanoramaEngine::stitch(const StitchRequest &request) {
   std::filesystem::create_directories(request.outputDirectory);
   const int64 started = cv::getTickCount();
 
-  std::vector<FrameGeometry> geometry(request.frames.size());
-  std::vector<ImageFeatures> features(request.frames.size());
-  std::vector<CameraParams> priorCameras;
-  priorCameras.reserve(request.frames.size());
-  cv::Ptr<cv::SIFT> featureFinder =
-      cv::SIFT::create(kMaximumFeatures, 3, 0.006, 15, 1.6);
+  std::vector<PreparedFrame> frames = buildAdaptiveLayout(request.frames);
 
-  for (std::size_t index = 0; index < request.frames.size(); ++index) {
-    cv::Mat fullImage = loadOrientedImage(request.frames[index]);
-    geometry[index].intrinsics = intrinsicsAdjustedToDecodedSize(
-        request.frames[index], fullImage.size());
-    geometry[index].workScale =
-        megapixelScale(fullImage.size(), kWorkMegapixels);
-    geometry[index].priorRotation =
-        openCVRotationFromCapturePose(request.frames[index]);
-
-    cv::Mat workImage = resizedImage(fullImage, geometry[index].workScale);
-    cv::detail::computeImageFeatures(featureFinder, workImage, features[index]);
-    features[index].img_idx = static_cast<int>(index);
-    geometry[index].featureCount =
-        static_cast<int>(features[index].keypoints.size());
-    priorCameras.push_back(cameraAtWorkScale(geometry[index]));
+  std::vector<int> ringSizes;
+  std::vector<int> ringDirections;
+  std::vector<int> ringPitchSigns;
+  for (const PreparedFrame &frame : frames) {
+    if (ringSizes.size() == static_cast<std::size_t>(frame.layout.ring)) {
+      ringSizes.push_back(frame.layout.ringSize);
+      ringDirections.push_back(frame.layout.direction);
+      ringPitchSigns.push_back(pitchSignForRing(frame.input.ring));
+    }
   }
 
-  RefinementSummary refinement;
-  cv::Mat topologyMask =
-      makeTopologyMask(request, geometry, refinement.approvedPairCount);
+  cv::Mat fullProbe = loadOrientedImage(frames.front().input);
+  const double workScale = megapixelScale(fullProbe.size(), kWorkMegapixels);
+  const double seamScale = megapixelScale(fullProbe.size(), kSeamMegapixels);
+  const double composeScale =
+      maximumDimensionScale(fullProbe.size(), kComposeSourceMaximumDimension);
+
+  std::vector<ImageFeatures> features(frames.size());
+  cv::Ptr<cv::SIFT> featureFinder = cv::SIFT::create(
+      kMaximumFeatures, 3, kSiftContrastThreshold, 15, 1.6);
+
+  for (std::size_t index = 0; index < frames.size(); ++index) {
+    cv::Mat fullImage = loadOrientedImage(frames[index].input);
+    frames[index].intrinsics =
+        intrinsicsAdjustedToDecodedSize(frames[index].input, fullImage.size());
+    frames[index].workScale = workScale;
+    cv::Mat workImage = resizedImage(fullImage, workScale);
+    cv::detail::computeImageFeatures(featureFinder, workImage, features[index]);
+    features[index].img_idx = static_cast<int>(index);
+    frames[index].featureCount =
+        static_cast<int>(features[index].keypoints.size());
+  }
+
+  int approvedPairCount = 0;
+  cv::Mat topologyMask = buildMatchMask(frames, approvedPairCount);
   cv::Ptr<cv::detail::BestOf2NearestMatcher> matcher =
-      cv::makePtr<cv::detail::BestOf2NearestMatcher>(false, 0.3f, 6, 6);
+      cv::makePtr<cv::detail::BestOf2NearestMatcher>(false, kMatchConfidence, 4,
+                                                     4);
   std::vector<MatchesInfo> pairwiseMatches;
   (*matcher)(features, pairwiseMatches, topologyMask.getUMat(cv::ACCESS_READ));
   matcher->collectGarbage();
 
-  std::vector<cv::Mat> rotations = refinePoses(
-      request, geometry, features, pairwiseMatches, priorCameras, refinement);
+  // Learned/RoMa augment is optional on device and unavailable in this build.
+  // Keep SIFT edges and continue with locked K + pitch prior.
 
-  // Feature descriptors are the largest retained work-stage allocation. They
-  // are no longer needed once bounded camera refinement is finished.
+  std::vector<int> component = cv::detail::leaveBiggestComponent(
+      features, pairwiseMatches, kConfidenceThreshold);
+  if (static_cast<int>(component.size()) != static_cast<int>(frames.size())) {
+    throw std::runtime_error(
+        "Confident match component is missing frames (" +
+        std::to_string(component.size()) + "/" +
+        std::to_string(frames.size()) + ")");
+  }
+  for (int index = 0; index < static_cast<int>(frames.size()); ++index) {
+    if (component[static_cast<std::size_t>(index)] != index) {
+      throw std::runtime_error(
+          "Confident match component reordered frames; refusing to drop inputs");
+    }
+  }
+
+  cv::Ptr<cv::detail::Estimator> estimator =
+      cv::makePtr<cv::detail::HomographyBasedEstimator>();
+  std::vector<CameraParams> cameras;
+  if (!(*estimator)(features, pairwiseMatches, cameras)) {
+    throw std::runtime_error("OpenCV homography-based camera estimation failed");
+  }
+  for (CameraParams &camera : cameras) {
+    cv::Mat rotation32;
+    camera.R.convertTo(rotation32, CV_32F);
+    camera.R = rotation32;
+  }
+
+  applyLockedIntrinsics(cameras, frames, true);
+
+  cv::Ptr<cv::detail::BundleAdjusterRay> adjuster =
+      cv::makePtr<cv::detail::BundleAdjusterRay>();
+  adjuster->setConfThresh(kConfidenceThreshold);
+  adjuster->setRefinementMask(cv::Mat::zeros(3, 3, CV_8U));
+  if (!(*adjuster)(features, pairwiseMatches, cameras)) {
+    throw std::runtime_error("OpenCV ray bundle adjustment failed");
+  }
+  applyLockedIntrinsics(cameras, frames, true);
+
+  std::vector<cv::Mat> waveRotations;
+  waveRotations.reserve(cameras.size());
+  for (const CameraParams &camera : cameras) {
+    waveRotations.push_back(camera.R.clone());
+  }
+  cv::detail::waveCorrect(waveRotations, cv::detail::WAVE_CORRECT_HORIZ);
+  for (std::size_t index = 0; index < cameras.size(); ++index) {
+    cameras[index].R = waveRotations[index];
+  }
+
+  const bool orientationFlipped =
+      normalizeWorldOrientation(cameras, frames, ringPitchSigns);
+
+  const std::vector<PitchPriorRecord> pitchRecords =
+      pullRingPitchesFromMetadata(cameras, frames, kPitchPriorWeight);
+  applyLockedIntrinsics(cameras, frames, true);
+
+  std::vector<double> focals;
+  focals.reserve(cameras.size());
+  for (const CameraParams &camera : cameras) {
+    focals.push_back(camera.focal);
+  }
+  const float warperScaleWork = static_cast<float>(medianOf(focals));
+
   features.clear();
   pairwiseMatches.clear();
-  priorCameras.clear();
 
-  SeamProducts seams = buildSeamsAndExposure(request, geometry, rotations);
+  SeamProducts seams = buildSeamsAndExposure(frames, cameras, warperScaleWork,
+                                             workScale, seamScale);
   const std::filesystem::path panoramaPath =
-      composePanorama(request, geometry, rotations, seams);
+      composePanorama(frames, cameras, seams, warperScaleWork, workScale,
+                      composeScale, request.outputDirectory);
   const std::filesystem::path reportPath =
       request.outputDirectory / "report.json";
   const double elapsedSeconds =
       (cv::getTickCount() - started) / cv::getTickFrequency();
-  writeReport(request, geometry, refinement, seams, panoramaPath, reportPath,
-              elapsedSeconds);
+  writeReport(frames, ringSizes, ringDirections, ringPitchSigns,
+              approvedPairCount, orientationFlipped, pitchRecords, seams,
+              panoramaPath, reportPath, elapsedSeconds, workScale, seamScale,
+              composeScale);
   return StitchArtifacts{panoramaPath, reportPath};
 }
 

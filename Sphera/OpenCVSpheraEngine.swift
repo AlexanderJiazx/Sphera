@@ -17,8 +17,7 @@ final class OpenCVSpheraEngine: NativeSpheraEngine, @unchecked Sendable {
     try await withCheckedThrowingContinuation { continuation in
       SpheraNativeEngineBridge.stitch(
         manifestURL: request.manifestURL,
-        outputDirectoryURL: request.outputDirectoryURL,
-        maximumPoseRefinementDegrees: request.maximumPoseRefinementDegrees
+        outputDirectoryURL: request.outputDirectoryURL
       ) { artifacts, error in
         if let error {
           continuation.resume(throwing: error)
