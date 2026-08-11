@@ -34,17 +34,7 @@ final class OpenCVSpheraEngine: NativeSpheraEngine, @unchecked Sendable {
       }
     }
 
-    report(progress, fraction: 0.05, message: "Loading frames")
-    await Task.yield()
-    report(progress, fraction: 0.08, message: "Pose-overlap graph")
-    await Task.yield()
-    report(progress, fraction: 0.15, message: "SIFT matching")
-    await Task.yield()
-    report(progress, fraction: 0.35, message: "Sensor-anchored refinement")
-    await Task.yield()
-    report(progress, fraction: 0.55, message: "Adaptive ring seam")
-    await Task.yield()
-    report(progress, fraction: 0.75, message: "Blending")
+    report(progress, fraction: 0, message: "Starting native stitch")
     await Task.yield()
 
     let result: StitchingResult = try await withCheckedThrowingContinuation { continuation in
@@ -52,7 +42,10 @@ final class OpenCVSpheraEngine: NativeSpheraEngine, @unchecked Sendable {
         manifestURL: request.manifestURL,
         outputDirectoryURL: request.outputDirectoryURL,
         matchCacheDirectoryURL: matchCacheURL,
-        enableLegacyLearnedMatches: enableLegacyLoFTRMatching && matchCacheURL != nil
+        enableLegacyLearnedMatches: enableLegacyLoFTRMatching && matchCacheURL != nil,
+        progressHandler: { fraction, message in
+          self.report(progress, fraction: fraction, message: message)
+        }
       ) { artifacts, error in
         if let error {
           continuation.resume(throwing: error)

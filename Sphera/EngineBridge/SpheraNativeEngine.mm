@@ -244,11 +244,13 @@ NSError *nativeError(NSString *description) {
         outputDirectoryURL:(NSURL *)outputDirectoryURL
          matchCacheDirectoryURL:(NSURL *)matchCacheDirectoryURL
          enableLegacyLearnedMatches:(BOOL)enableLegacyLearnedMatches
+            progressHandler:(SpheraNativeStitchProgressHandler)progressHandler
                 completion:(SpheraNativeStitchCompletion)completion {
   NSURL *manifestCopy = [manifestURL copy];
   NSURL *outputCopy = [outputDirectoryURL copy];
   NSURL *matchCacheCopy = [matchCacheDirectoryURL copy];
   const BOOL enableLegacy = enableLegacyLearnedMatches;
+  SpheraNativeStitchProgressHandler progressCopy = [progressHandler copy];
   SpheraNativeStitchCompletion completionCopy = [completion copy];
 
   dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
@@ -261,6 +263,14 @@ NSError *nativeError(NSString *description) {
         request.enableLegacyLearnedMatches = enableLegacy;
         if (enableLegacy && matchCacheCopy != nil) {
           request.learnedMatchCacheDirectory = fileSystemPath(matchCacheCopy);
+        }
+        if (progressCopy != nil) {
+          request.progress = [progressCopy](double fraction,
+                                            const std::string &message) {
+            NSString *text =
+                [NSString stringWithUTF8String:message.c_str()] ?: @"";
+            progressCopy(fraction, text);
+          };
         }
         sphera::StitchArtifacts artifacts =
             sphera::PanoramaEngine::stitch(request);

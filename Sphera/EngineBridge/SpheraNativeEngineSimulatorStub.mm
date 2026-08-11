@@ -7,15 +7,19 @@
 
 @implementation SpheraNativeEngineBridge
 
-+ (void)stitchWithManifestURL:(NSURL *)manifestURL
-           outputDirectoryURL:(NSURL *)outputDirectoryURL
-      matchCacheDirectoryURL:(NSURL *)matchCacheDirectoryURL
-    enableLegacyLearnedMatches:(BOOL)enableLegacyLearnedMatches
-                   completion:(SpheraNativeStitchCompletion)completion {
++ (void)stitchManifestAtURL:(NSURL *)manifestURL
+        outputDirectoryURL:(NSURL *)outputDirectoryURL
+         matchCacheDirectoryURL:(NSURL *)matchCacheDirectoryURL
+         enableLegacyLearnedMatches:(BOOL)enableLegacyLearnedMatches
+            progressHandler:(SpheraNativeStitchProgressHandler)progressHandler
+                completion:(SpheraNativeStitchCompletion)completion {
   (void)manifestURL;
   (void)outputDirectoryURL;
   (void)matchCacheDirectoryURL;
   (void)enableLegacyLearnedMatches;
+  if (progressHandler) {
+    progressHandler(0.0, @"Simulator stub");
+  }
   NSError *error = [NSError
       errorWithDomain:@"com.sphera.capture.native-engine"
                  code:100

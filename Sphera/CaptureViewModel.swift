@@ -191,10 +191,10 @@ final class CaptureViewModel: ObservableObject {
 
   func computeOnDevice(package: CapturePackage, replaceExisting: Bool = false) async {
     phase = .stitching
-    stitchProgress = 0
+    stitchProgress = nil
     statusMessage = replaceExisting
       ? "Recomputing panorama on device"
-      : "Computing panorama on device"
+      : "Starting native stitch"
     camera.stop()
     motion.stop()
 
@@ -205,11 +205,12 @@ final class CaptureViewModel: ObservableObject {
       let result = try await stitcher.stitch(package: package) { [weak self] update in
         Task { @MainActor in
           guard let self else { return }
+          // Live pipeline stage text; fraction is kept only for diagnostics.
           self.stitchProgress = update.fraction
           self.statusMessage = update.message
         }
       }
-      stitchProgress = 1
+      stitchProgress = nil
       phase = .completed(
         CaptureCompletion(
           package: package,

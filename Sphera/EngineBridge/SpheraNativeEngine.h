@@ -19,6 +19,10 @@ NS_ASSUME_NONNULL_BEGIN
 typedef void (^SpheraNativeStitchCompletion)(
     SpheraNativeStitchArtifacts *_Nullable artifacts, NSError *_Nullable error);
 
+/// Called from the stitch worker thread with the current pipeline stage.
+typedef void (^SpheraNativeStitchProgressHandler)(double fraction,
+                                                  NSString *message);
+
 /// Objective-C-only surface for the Swift/C++ boundary. No OpenCV or C++ type
 /// crosses this header.
 @interface SpheraNativeEngineBridge : NSObject
@@ -27,8 +31,9 @@ typedef void (^SpheraNativeStitchCompletion)(
         outputDirectoryURL:(NSURL *)outputDirectoryURL
          matchCacheDirectoryURL:(NSURL *_Nullable)matchCacheDirectoryURL
          enableLegacyLearnedMatches:(BOOL)enableLegacyLearnedMatches
+            progressHandler:(SpheraNativeStitchProgressHandler _Nullable)progressHandler
                 completion:(SpheraNativeStitchCompletion)completion
-    NS_SWIFT_NAME(stitch(manifestURL:outputDirectoryURL:matchCacheDirectoryURL:enableLegacyLearnedMatches:completion:));
+    NS_SWIFT_NAME(stitch(manifestURL:outputDirectoryURL:matchCacheDirectoryURL:enableLegacyLearnedMatches:progressHandler:completion:));
 
 @end
 

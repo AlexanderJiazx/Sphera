@@ -18,8 +18,7 @@ struct ContentView: View {
       case .stitching:
         StatusView(
           title: "Computing panorama",
-          detail: model.statusMessage,
-          progress: model.stitchProgress
+          detail: model.statusMessage
         )
       case .completed(let completion):
         CaptureResultView(completion: completion) {
@@ -274,26 +273,19 @@ private struct SavedCaptureView: View {
 private struct StatusView: View {
   let title: String
   let detail: String
-  var progress: Double? = nil
 
   var body: some View {
-    VStack(spacing: 14) {
-      if let progress {
-        ProgressView(value: min(1, max(0, progress)))
-          .progressViewStyle(.linear)
-          .frame(maxWidth: 280)
-        Text("\(Int((min(1, max(0, progress)) * 100).rounded()))%")
-          .font(.headline.monospacedDigit())
-          .foregroundStyle(.secondary)
-      } else {
-        ProgressView()
-          .controlSize(.large)
-      }
+    VStack(spacing: 16) {
+      ProgressView()
+        .controlSize(.large)
       Text(title)
         .font(.title2.bold())
       Text(detail)
-        .foregroundStyle(.secondary)
+        .font(.body)
+        .foregroundStyle(.primary)
         .multilineTextAlignment(.center)
+        .contentTransition(.opacity)
+        .animation(.easeInOut(duration: 0.2), value: detail)
     }
     .padding(30)
   }
