@@ -32,26 +32,23 @@ actor CapturePackageStore {
       imageDirectory: "images",
       coreMotionReferenceFrame: coreMotionReferenceFrame,
       engineInitialization: EngineInitializationMetadata(
-        placementSource: "estimate",
+        placementSource: "recorded",
         rotationField: "frames[].pose.cameraToCaptureReferenceRotationMatrix",
         usePosePriors: true,
-        allowGlobalArrangementRediscovery: true,
-        maximumPoseRefinementDegrees: nil,
+        allowGlobalArrangementRediscovery: false,
+        maximumPoseRefinementDegrees: 6,
         refinementPurpose:
-          "On-device: match-based arrangement with locked shared intrinsics and CoreMotion ring pitch prior (falls back to recorded poses if the match graph is incomplete). Offline quality: share the capture archive and run Engine scripts/run_hierarchical_loftr.py (compact outdoor LoFTR ~44MB).",
+          "On-device sensor-first S1: recorded capture_ref poses with per-frame locked intrinsics, pose-overlap SIFT pairs, bounded sensor-anchored refinement (6° cap), adaptive periodic ring seam, and five-band blend. LoFTR remains an optional offline diagnostic only.",
         enabledPipelineStages: [
-          "adaptive-ring-layout",
-          "feature-matching",
-          "homography-camera-estimate",
-          "recorded-pose-fallback",
-          "locked-shared-intrinsics",
-          "ray-bundle-adjustment",
-          "wave-correct",
-          "normalize-world-orientation",
-          "coremotion-ring-pitch-prior",
-          "seam-optimization",
-          "exposure-correction",
-          "blending",
+          "manifest-canonicalize",
+          "pose-overlap-graph",
+          "per-frame-locked-intrinsics",
+          "sift-matching",
+          "sensor-anchored-refinement",
+          "adaptive-periodic-ring-seam",
+          "structure-aware-graph-cut",
+          "exposure-gain-blocks",
+          "five-band-blend",
         ]
       ),
       frames: []
@@ -214,8 +211,9 @@ actor CapturePackageStore {
     }
   }
 
-  /// Imports a Mac/Engine hierarchical LoFTR (or any) equirectangular result into
-  /// the capture package so the on-device gallery/viewer can display it.
+  /// Imports an external equirectangular result into the capture package so
+  /// the on-device gallery/viewer can display it (Engine sensor-first or
+  /// optional offline diagnostic outputs).
   func importEnginePanorama(
     into package: CapturePackage,
     panoramaURL: URL,

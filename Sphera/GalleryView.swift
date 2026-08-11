@@ -281,7 +281,7 @@ struct GalleryDetailView: View {
       }
     } footer: {
       Text(
-        "For highest quality, share the archive to a Mac and run Engine scripts/run_hierarchical_loftr.py (compact outdoor LoFTR, ~44 MB), then import panorama_equirectangular.jpg here."
+        "On-device stitching uses sensor-first SIFT (no ML models). LoFTR remains an optional offline diagnostic only—share the archive if you need to compare Engine oracle outputs."
       )
     }
   }

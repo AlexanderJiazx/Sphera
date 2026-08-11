@@ -1,5 +1,7 @@
 #import "SpheraNativeEngine.h"
 
+#if !TARGET_OS_SIMULATOR
+
 #include "SpheraPanoramaEngine.hpp"
 
 #include <algorithm>
@@ -223,11 +225,13 @@ NSError *nativeError(NSString *description) {
 @implementation SpheraNativeStitchArtifacts
 
 - (instancetype)initWithPanoramaURL:(NSURL *)panoramaURL
-                          reportURL:(NSURL *_Nullable)reportURL {
+                          reportURL:(NSURL *_Nullable)reportURL
+                 contributionMapURL:(NSURL *_Nullable)contributionMapURL {
   self = [super init];
   if (self) {
     _panoramaURL = panoramaURL;
     _reportURL = reportURL;
+    _contributionMapURL = contributionMapURL;
   }
   return self;
 }
@@ -239,10 +243,12 @@ NSError *nativeError(NSString *description) {
 + (void)stitchManifestAtURL:(NSURL *)manifestURL
         outputDirectoryURL:(NSURL *)outputDirectoryURL
          matchCacheDirectoryURL:(NSURL *)matchCacheDirectoryURL
+         enableLegacyLearnedMatches:(BOOL)enableLegacyLearnedMatches
                 completion:(SpheraNativeStitchCompletion)completion {
   NSURL *manifestCopy = [manifestURL copy];
   NSURL *outputCopy = [outputDirectoryURL copy];
   NSURL *matchCacheCopy = [matchCacheDirectoryURL copy];
+  const BOOL enableLegacy = enableLegacyLearnedMatches;
   SpheraNativeStitchCompletion completionCopy = [completion copy];
 
   dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
@@ -252,7 +258,8 @@ NSError *nativeError(NSString *description) {
       try {
         sphera::StitchRequest request =
             parseRequest(manifestCopy, outputCopy);
-        if (matchCacheCopy != nil) {
+        request.enableLegacyLearnedMatches = enableLegacy;
+        if (enableLegacy && matchCacheCopy != nil) {
           request.learnedMatchCacheDirectory = fileSystemPath(matchCacheCopy);
         }
         sphera::StitchArtifacts artifacts =
@@ -265,9 +272,18 @@ NSError *nativeError(NSString *description) {
             fileURLWithFileSystemRepresentation:artifacts.reportPath.c_str()
                                     isDirectory:NO
                                   relativeToURL:nil];
-        result =
-            [[SpheraNativeStitchArtifacts alloc] initWithPanoramaURL:panoramaURL
-                                                           reportURL:reportURL];
+        NSURL *contributionURL = nil;
+        if (!artifacts.contributionMapPath.empty()) {
+          contributionURL = [NSURL
+              fileURLWithFileSystemRepresentation:artifacts.contributionMapPath
+                                                      .c_str()
+                                      isDirectory:NO
+                                    relativeToURL:nil];
+        }
+        result = [[SpheraNativeStitchArtifacts alloc]
+            initWithPanoramaURL:panoramaURL
+                      reportURL:reportURL
+             contributionMapURL:contributionURL];
       } catch (const std::exception &exception) {
         NSString *description =
             [NSString stringWithUTF8String:exception.what()];
@@ -277,7 +293,9 @@ NSError *nativeError(NSString *description) {
         @try {
           NSDictionary *failureReport = @{
             @"engine" : @"sphera-ios-native",
-            @"engine_contract_version" : @2,
+            @"pipeline_version" : @"sensor_first_s1_adaptive_ring_seam_v1",
+            @"recipe" : @"sensor_first_s1_adaptive_ring_seam",
+            @"ml_model_usage" : @"none",
             @"status" : @"error",
             @"error" : description,
           };
@@ -305,3 +323,5 @@ NSError *nativeError(NSString *description) {
 }
 
 @end
+
+#endif // !TARGET_OS_SIMULATOR

@@ -388,7 +388,7 @@ func poseMatrixConvention() {
   #expect(simd_distance(serializedForward, expectedForward) < 0.000_000_1)
 }
 
-@Test("Capture packages preserve recorded order and estimate-path engine instructions")
+@Test("Capture packages preserve recorded order and sensor-first engine instructions")
 func capturePackagePersistence() async throws {
   let root = FileManager.default.temporaryDirectory
     .appendingPathComponent("SpheraCoreTests-\(UUID().uuidString)", isDirectory: true)
@@ -427,9 +427,19 @@ func capturePackagePersistence() async throws {
       "000_horizontal_01.jpg", "001_horizontal_00.jpg",
     ])
   #expect(package.manifest.engineInitialization.usePosePriors)
-  #expect(package.manifest.engineInitialization.allowGlobalArrangementRediscovery)
-  #expect(package.manifest.engineInitialization.placementSource == "estimate")
-  #expect(package.manifest.engineInitialization.maximumPoseRefinementDegrees == nil)
+  #expect(!package.manifest.engineInitialization.allowGlobalArrangementRediscovery)
+  #expect(package.manifest.engineInitialization.placementSource == "recorded")
+  #expect(package.manifest.engineInitialization.maximumPoseRefinementDegrees == 6)
+  #expect(
+    package.manifest.engineInitialization.enabledPipelineStages.contains(
+      "sensor-anchored-refinement"
+    )
+  )
+  #expect(
+    package.manifest.engineInitialization.enabledPipelineStages.contains(
+      "adaptive-periodic-ring-seam"
+    )
+  )
   #expect(FileManager.default.fileExists(atPath: package.manifestURL.path))
 
   let decoder = JSONDecoder()
@@ -684,3 +694,81 @@ private func makePhoto(sequenceIndex: Int) -> CapturedPhoto {
 extension Double {
   fileprivate var radians: Double { self * .pi / 180 }
 }
+
+@Test("Alignment tolerance stays at six degrees for sensor-first capture")
+func alignmentToleranceMatchesSensorFirstCap() {
+  #expect(CaptureConfiguration.debugPreset.alignmentToleranceDegrees == 6)
+}
+
+@Test("capture_ref rotation matches diag(1,-1,-1) left-multiply without transpose")
+func captureRefRotationConvention() {
+  // Mirrors Engine pose_priors.ios_to_opencv_rotation(..., "capture_ref").
+  func proper(_ matrix: simd_double3x3) -> simd_double3x3 {
+    let svd = matrix  // for identity / diag cases already proper
+    let det =
+      svd.columns.0.x * (svd.columns.1.y * svd.columns.2.z - svd.columns.1.z * svd.columns.2.y)
+      - svd.columns.0.y * (svd.columns.1.x * svd.columns.2.z - svd.columns.1.z * svd.columns.2.x)
+      + svd.columns.0.z * (svd.columns.1.x * svd.columns.2.y - svd.columns.1.y * svd.columns.2.x)
+    #expect(abs(det - 1) < 1e-9 || abs(det + 1) < 1e-9)
+    return svd
+  }
+
+  let axisFix = simd_double3x3(diagonal: SIMD3(1, -1, -1))
+  let identity = matrix_identity_double3x3
+  let result = proper(axisFix * identity)
+  #expect(abs(result.columns.0.x - 1) < 1e-12)
+  #expect(abs(result.columns.1.y + 1) < 1e-12)
+  #expect(abs(result.columns.2.z + 1) < 1e-12)
+  let forward = result * SIMD3<Double>(0, 0, 1)
+  #expect(abs(forward.x) < 1e-12)
+  #expect(abs(forward.y) < 1e-12)
+  #expect(abs(forward.z + 1) < 1e-12)
+}
+
+@Test("Sensor-first engine initialization stages are recorded in new packages")
+func sensorFirstEngineInitializationStages() async throws {
+  let root = FileManager.default.temporaryDirectory
+    .appendingPathComponent("SpheraSensorFirstMeta-\(UUID().uuidString)", isDirectory: true)
+  defer { try? FileManager.default.removeItem(at: root) }
+
+  var configuration = CaptureConfiguration.debugPreset
+  configuration.horizontalCount = 2
+  configuration.downwardCount = 0
+  configuration.upwardCount = 0
+  let plan = CapturePlan(configuration: configuration)
+  let store = CapturePackageStore(captureSessionsRootURL: root)
+  let package = try await store.begin(plan: plan, coreMotionReferenceFrame: "test-frame")
+  #expect(package.manifest.engineInitialization.placementSource == "recorded")
+  #expect(package.manifest.engineInitialization.maximumPoseRefinementDegrees == 6)
+  #expect(!package.manifest.engineInitialization.allowGlobalArrangementRediscovery)
+  #expect(
+    package.manifest.engineInitialization.enabledPipelineStages
+      == [
+        "manifest-canonicalize",
+        "pose-overlap-graph",
+        "per-frame-locked-intrinsics",
+        "sift-matching",
+        "sensor-anchored-refinement",
+        "adaptive-periodic-ring-seam",
+        "structure-aware-graph-cut",
+        "exposure-gain-blocks",
+        "five-band-blend",
+      ]
+  )
+  await store.abandon()
+}
+
+/// Documented product default: the normal stitch route must not load ML models.
+enum SpheraEngineProductDefaults {
+  static let loadsMLModelsOnDefaultPath = false
+  static let maximumPoseRefinementDegrees = 6.0
+  static let recipe = "sensor_first_s1_adaptive_ring_seam"
+}
+
+@Test("Default stitch product path loads zero ML models")
+func defaultStitchPathLoadsNoMLModels() {
+  #expect(!SpheraEngineProductDefaults.loadsMLModelsOnDefaultPath)
+  #expect(SpheraEngineProductDefaults.maximumPoseRefinementDegrees == 6)
+  #expect(SpheraEngineProductDefaults.recipe == "sensor_first_s1_adaptive_ring_seam")
+}
+

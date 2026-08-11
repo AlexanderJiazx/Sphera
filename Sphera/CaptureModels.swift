@@ -50,7 +50,7 @@ struct CaptureConfiguration: Codable, Equatable, Sendable {
     upwardCount: 5,
     downwardPitchDegrees: -55,
     upwardPitchDegrees: 55,
-    alignmentToleranceDegrees: 12,
+    alignmentToleranceDegrees: 6,
     stableHoldDurationSeconds: 0.3,
     maximumPoseRefinementDegrees: 8
   )
@@ -332,11 +332,13 @@ struct CapturedFrameRecord: Codable, Identifiable, Equatable, Sendable {
 }
 
 struct EngineInitializationMetadata: Codable, Equatable, Sendable {
+  /// `"recorded"` for sensor-first placement; older manifests may still say `"estimate"`.
   let placementSource: String
   let rotationField: String
   let usePosePriors: Bool
+  /// Always `false` on the sensor-first product path.
   let allowGlobalArrangementRediscovery: Bool
-  /// Unused on the outdoor estimate path (`null` in the winning Engine recipe).
+  /// Soft cap for SIFT sensor-anchored correction degrees (`6` on-device).
   let maximumPoseRefinementDegrees: Double?
   let refinementPurpose: String
   let enabledPipelineStages: [String]

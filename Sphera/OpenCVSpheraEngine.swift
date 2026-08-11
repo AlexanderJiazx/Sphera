@@ -2,47 +2,57 @@ import CoreML
 import Foundation
 import UIKit
 
-/// Builds LoFTR match caches for topology-approved pairs, then runs the native
-/// OpenCV stitcher with those matches injected (augment mode).
+/// Default path: sensor-first OpenCV stitch (no LoFTR / CoreML).
+/// Set `enableLegacyLoFTRMatching` only for offline diagnostic caches.
 final class OpenCVSpheraEngine: NativeSpheraEngine, @unchecked Sendable {
+  /// Developer diagnostic only. Never auto-enabled.
+  var enableLegacyLoFTRMatching = false
+
   func stitch(
     _ request: SpheraEngineRequest,
     progress: StitchProgressHandler?
   ) async throws -> StitchingResult {
-    let matchCacheURL = request.outputDirectoryURL
-      .appendingPathComponent("loftr-cache", isDirectory: true)
-
-    report(progress, fraction: 0.02, message: "Preparing LoFTR matching")
-    await Task.yield()
-
-    var usedLoFTR = false
-    do {
-      try await buildLoFTRCache(
-        request: request,
-        cacheDirectory: matchCacheURL,
-        progress: progress
-      )
-      usedLoFTR = FileManager.default.fileExists(
-        atPath: matchCacheURL.appendingPathComponent("manifest.json").path
-      )
-    } catch {
-      NSLog("LoFTR cache build failed: %@", error.localizedDescription)
-      report(progress, fraction: 0.9, message: "LoFTR failed — OpenCV only")
+    var matchCacheURL: URL?
+    if enableLegacyLoFTRMatching {
+      let cacheURL = request.outputDirectoryURL
+        .appendingPathComponent("loftr-cache", isDirectory: true)
+      report(progress, fraction: 0.02, message: "Preparing legacy LoFTR matching")
       await Task.yield()
+      do {
+        try await buildLoFTRCache(
+          request: request,
+          cacheDirectory: cacheURL,
+          progress: progress
+        )
+        if FileManager.default.fileExists(
+          atPath: cacheURL.appendingPathComponent("manifest.json").path
+        ) {
+          matchCacheURL = cacheURL
+        }
+      } catch {
+        NSLog("Legacy LoFTR cache build failed: %@", error.localizedDescription)
+      }
     }
 
-    report(
-      progress,
-      fraction: 0.92,
-      message: usedLoFTR ? "Stitching with LoFTR matches" : "Stitching panorama"
-    )
+    report(progress, fraction: 0.05, message: "Loading frames")
+    await Task.yield()
+    report(progress, fraction: 0.08, message: "Pose-overlap graph")
+    await Task.yield()
+    report(progress, fraction: 0.15, message: "SIFT matching")
+    await Task.yield()
+    report(progress, fraction: 0.35, message: "Sensor-anchored refinement")
+    await Task.yield()
+    report(progress, fraction: 0.55, message: "Adaptive ring seam")
+    await Task.yield()
+    report(progress, fraction: 0.75, message: "Blending")
     await Task.yield()
 
     let result: StitchingResult = try await withCheckedThrowingContinuation { continuation in
       SpheraNativeEngineBridge.stitch(
         manifestURL: request.manifestURL,
         outputDirectoryURL: request.outputDirectoryURL,
-        matchCacheDirectoryURL: usedLoFTR ? matchCacheURL : nil
+        matchCacheDirectoryURL: matchCacheURL,
+        enableLegacyLearnedMatches: enableLegacyLoFTRMatching && matchCacheURL != nil
       ) { artifacts, error in
         if let error {
           continuation.resume(throwing: error)

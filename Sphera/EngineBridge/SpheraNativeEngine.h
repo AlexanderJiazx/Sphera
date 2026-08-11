@@ -6,9 +6,11 @@ NS_ASSUME_NONNULL_BEGIN
 
 @property(nonatomic, readonly) NSURL *panoramaURL;
 @property(nonatomic, readonly, nullable) NSURL *reportURL;
+@property(nonatomic, readonly, nullable) NSURL *contributionMapURL;
 
 - (instancetype)initWithPanoramaURL:(NSURL *)panoramaURL
                           reportURL:(nullable NSURL *)reportURL
+                 contributionMapURL:(nullable NSURL *)contributionMapURL
     NS_DESIGNATED_INITIALIZER;
 - (instancetype)init NS_UNAVAILABLE;
 
@@ -24,8 +26,9 @@ typedef void (^SpheraNativeStitchCompletion)(
 + (void)stitchManifestAtURL:(NSURL *)manifestURL
         outputDirectoryURL:(NSURL *)outputDirectoryURL
          matchCacheDirectoryURL:(NSURL *_Nullable)matchCacheDirectoryURL
+         enableLegacyLearnedMatches:(BOOL)enableLegacyLearnedMatches
                 completion:(SpheraNativeStitchCompletion)completion
-    NS_SWIFT_NAME(stitch(manifestURL:outputDirectoryURL:matchCacheDirectoryURL:completion:));
+    NS_SWIFT_NAME(stitch(manifestURL:outputDirectoryURL:matchCacheDirectoryURL:enableLegacyLearnedMatches:completion:));
 
 @end
 

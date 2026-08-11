@@ -7,7 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		000000000000000000000032 /* OpenCV/opencv2.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 000000000000000000000031 /* OpenCV/opencv2.framework */; };
+		000000000000000000000032 /* OpenCV/opencv2.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 000000000000000000000031 /* OpenCV/opencv2.framework */; platformFilters = (iphoneos, ); };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -301,12 +301,17 @@
 					"-lc++",
 					"-lz",
 				);
+				"OTHER_LDFLAGS[sdk=iphoneos*]" = (
+					"$(inherited)",
+					"-force_load",
+					"$(PROJECT_DIR)/Vendor/OpenCV/opencv2.framework/opencv2",
+				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.sphera.capture;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
 				SDKROOT = iphoneos;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
-				SUPPORTED_PLATFORMS = iphoneos;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SUPPORTS_MACCATALYST = NO;
 				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
@@ -316,6 +321,18 @@
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = 1;
+				"EXCLUDED_SOURCE_FILE_NAMES[sdk=iphonesimulator*]" = (
+					"SpheraPanoramaEngine.cpp",
+					"SpheraEngineMath.cpp",
+					"SpheraPoseOverlap.cpp",
+					"SpheraRotationRefinement.cpp",
+					"SpheraAdaptiveRingSeam.cpp",
+					"SpheraDirectSphere.cpp",
+					"SpheraNativeEngine.mm",
+				);
+				"EXCLUDED_SOURCE_FILE_NAMES[sdk=iphoneos*]" = (
+					"SpheraNativeEngineSimulatorStub.mm",
+				);
 			};
 			name = Debug;
 		};
@@ -358,12 +375,17 @@
 					"-lc++",
 					"-lz",
 				);
+				"OTHER_LDFLAGS[sdk=iphoneos*]" = (
+					"$(inherited)",
+					"-force_load",
+					"$(PROJECT_DIR)/Vendor/OpenCV/opencv2.framework/opencv2",
+				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.sphera.capture;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
 				SDKROOT = iphoneos;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
-				SUPPORTED_PLATFORMS = iphoneos;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SUPPORTS_MACCATALYST = NO;
 				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
@@ -373,6 +395,18 @@
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = 1;
+				"EXCLUDED_SOURCE_FILE_NAMES[sdk=iphonesimulator*]" = (
+					"SpheraPanoramaEngine.cpp",
+					"SpheraEngineMath.cpp",
+					"SpheraPoseOverlap.cpp",
+					"SpheraRotationRefinement.cpp",
+					"SpheraAdaptiveRingSeam.cpp",
+					"SpheraDirectSphere.cpp",
+					"SpheraNativeEngine.mm",
+				);
+				"EXCLUDED_SOURCE_FILE_NAMES[sdk=iphoneos*]" = (
+					"SpheraNativeEngineSimulatorStub.mm",
+				);
 			};
 			name = Release;
 		};

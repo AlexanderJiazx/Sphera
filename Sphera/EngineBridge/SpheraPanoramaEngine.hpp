@@ -2,6 +2,7 @@
 
 #include <array>
 #include <filesystem>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -34,25 +35,31 @@ struct FrameInput {
   int exifOrientation = 1;
   CameraIntrinsics intrinsics;
 
-  /// Row-major rotation mapping display-oriented camera coordinates into the
-  /// gravity-level capture reference frame. Used for locked-K pitch prior only;
-  /// arrangement is rediscovered from matches.
+  /// Row-major camera→capture-reference rotation from CoreMotion metadata.
+  /// Converted with capture_ref and stored as camera-to-world in CameraParams.R.
   std::array<double, 9> cameraToCaptureReferenceRotation{};
 };
+
+using StitchProgressCallback =
+    std::function<void(double fraction, const std::string &message)>;
 
 struct StitchRequest {
   std::vector<FrameInput> frames;
   std::filesystem::path outputDirectory;
-  /// Optional on-device LoFTR match cache directory (manifest.json + pair bins).
+  /// Optional LoFTR match cache. Loaded only when enableLegacyLearnedMatches.
   std::filesystem::path learnedMatchCacheDirectory;
+  /// Developer diagnostic only. Default false — product path loads zero ML.
+  bool enableLegacyLearnedMatches = false;
+  StitchProgressCallback progress;
 };
 
 struct StitchArtifacts {
   std::filesystem::path panoramaPath;
   std::filesystem::path reportPath;
+  std::filesystem::path contributionMapPath;
 };
 
-/// iOS-native outdoor stitch recipe with optional on-device LoFTR augment.
+/// Sensor-first S1 + adaptive periodic ring seam (no ML on the default path).
 class PanoramaEngine final {
 public:
   static StitchArtifacts stitch(const StitchRequest &request);
