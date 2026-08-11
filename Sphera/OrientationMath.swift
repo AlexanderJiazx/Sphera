@@ -145,6 +145,129 @@ enum OrientationMath {
     )
   }
 
+  /// Classifies a primary capture into a ring using midpoints between the
+  /// horizontal plane and the configured upward/downward ring pitches.
+  static func classifyCaptureRing(
+    pitchDegrees: Double,
+    configuration: CaptureConfiguration
+  ) -> CaptureRing {
+    let upwardBoundary = configuration.upwardPitchDegrees * 0.5
+    let downwardBoundary = configuration.downwardPitchDegrees * 0.5
+    if pitchDegrees >= upwardBoundary {
+      return .upward
+    }
+    if pitchDegrees <= downwardBoundary {
+      return .downward
+    }
+    return .horizontal
+  }
+
+  /// Current camera pitch in the capture frame (degrees, gravity-up positive).
+  static func currentPitchDegrees(
+    sample: MotionSample,
+    captureReference: CaptureReferenceFrame
+  ) -> Double {
+    let currentCamera = cameraToCaptureReference(
+      sample: sample,
+      captureReference: captureReference
+    )
+    let forward = simd_act(currentCamera, SIMD3<Double>(0, 0, 1))
+    return asin(min(1, max(-1, forward.y))).degrees
+  }
+
+  /// Picks the closest planned target in `ring` to the current camera pose.
+  static func closestTarget(
+    in ring: CaptureRing,
+    targets: [CaptureTarget],
+    sample: MotionSample,
+    captureReference: CaptureReferenceFrame
+  ) -> CaptureTarget? {
+    let candidates = targets.filter { $0.ring == ring }
+    guard !candidates.isEmpty else { return nil }
+    return candidates.min { lhs, rhs in
+      let left = navigationReading(
+        sample: sample,
+        captureReference: captureReference,
+        target: lhs,
+        toleranceDegrees: 180
+      ).directionErrorDegrees
+      let right = navigationReading(
+        sample: sample,
+        captureReference: captureReference,
+        target: rhs,
+        toleranceDegrees: 180
+      ).directionErrorDegrees
+      return left < right
+    }
+  }
+
+  /// Among remaining targets, returns the nearest by spherical direction error.
+  static func nearestTarget(
+    among targets: [CaptureTarget],
+    sample: MotionSample,
+    captureReference: CaptureReferenceFrame,
+    toleranceDegrees: Double
+  ) -> (target: CaptureTarget, reading: CaptureNavigationReading)? {
+    guard !targets.isEmpty else { return nil }
+    var best: (CaptureTarget, CaptureNavigationReading)?
+    for target in targets {
+      let reading = navigationReading(
+        sample: sample,
+        captureReference: captureReference,
+        target: target,
+        toleranceDegrees: toleranceDegrees
+      )
+      if let current = best {
+        if reading.directionErrorDegrees < current.1.directionErrorDegrees {
+          best = (target, reading)
+        }
+      } else {
+        best = (target, reading)
+      }
+    }
+    return best.map { (target: $0.0, reading: $0.1) }
+  }
+
+  /// Projects a target direction into normalized screen offsets from the optical
+  /// center. `x`/`y` are approximately radians of visual angle (positive x = right,
+  /// positive y = down). `isInFront` is false when the target is behind the camera.
+  static func projectTargetToScreen(
+    sample: MotionSample,
+    captureReference: CaptureReferenceFrame,
+    target: CaptureTarget
+  ) -> CapturePointProjection {
+    let currentCamera = cameraToCaptureReference(
+      sample: sample,
+      captureReference: captureReference
+    )
+    let targetCamera = targetCameraToCaptureReference(target)
+    let targetDirectionInCapture = simd_act(targetCamera, SIMD3<Double>(0, 0, 1))
+    let directionInCamera = simd_act(
+      currentCamera.inverse,
+      targetDirectionInCapture
+    )
+    let forward = directionInCamera.z
+    let isInFront = forward > 0.02
+    let safeForward = max(abs(forward), 0.02) * (forward >= 0 ? 1 : -1)
+    let offsetX = directionInCamera.x / safeForward
+    let offsetY = directionInCamera.y / safeForward
+    let reading = navigationReading(
+      sample: sample,
+      captureReference: captureReference,
+      target: target,
+      toleranceDegrees: 180
+    )
+    return CapturePointProjection(
+      targetID: target.id,
+      ring: target.ring,
+      offsetX: offsetX,
+      offsetY: offsetY,
+      directionErrorDegrees: reading.directionErrorDegrees,
+      isInFront: isInFront,
+      isAligned: false
+    )
+  }
+
   private static func rejecting(
     _ vector: SIMD3<Double>,
     from axis: SIMD3<Double>
@@ -225,6 +348,18 @@ struct CaptureNavigationReading: Equatable, Sendable {
     pitchErrorDegrees: 0,
     isAligned: false
   )
+}
+
+struct CapturePointProjection: Equatable, Identifiable, Sendable {
+  var id: String { targetID }
+  let targetID: String
+  let ring: CaptureRing
+  /// Approximate radians of visual angle from optical center; +x right, +y down.
+  let offsetX: Double
+  let offsetY: Double
+  let directionErrorDegrees: Double
+  let isInFront: Bool
+  let isAligned: Bool
 }
 
 extension QuaternionValue {

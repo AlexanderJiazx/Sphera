@@ -8,6 +8,11 @@ struct GalleryView: View {
   @State private var shareErrorMessage: String?
   @State private var isPreparingShare = false
 
+  private let columns = [
+    GridItem(.flexible(), spacing: 12),
+    GridItem(.flexible(), spacing: 12),
+  ]
+
   var body: some View {
     Group {
       if model.isRefreshingGallery && model.galleryPackages.isEmpty {
@@ -19,32 +24,34 @@ struct GalleryView: View {
           description: Text("Finished captures are saved here with images and motion data.")
         )
       } else {
-        List {
-          ForEach(model.galleryPackages, id: \.manifest.sessionID) { package in
-            NavigationLink {
-              GalleryDetailView(
-                model: model,
-                package: package,
-                onShare: { await presentShare(for: package) }
-              )
-            } label: {
-              GalleryRowView(package: package)
-            }
-          }
-          .onDelete { indexSet in
-            let packages = indexSet.map { model.galleryPackages[$0] }
-            Task {
-              for package in packages {
-                await model.deleteFromGallery(package)
+        ScrollView {
+          LazyVGrid(columns: columns, spacing: 12) {
+            ForEach(model.galleryPackages, id: \.manifest.sessionID) { package in
+              NavigationLink {
+                GalleryDetailView(
+                  model: model,
+                  package: package,
+                  onShare: { await presentShare(for: package) }
+                )
+              } label: {
+                GalleryGridCard(package: package)
+              }
+              .buttonStyle(.plain)
+              .contextMenu {
+                Button(role: .destructive) {
+                  Task { await model.deleteFromGallery(package) }
+                } label: {
+                  Label("Delete", systemImage: "trash")
+                }
               }
             }
           }
+          .padding(16)
         }
-        .listStyle(.insetGrouped)
       }
     }
     .navigationTitle("Gallery")
-    .navigationBarTitleDisplayMode(.inline)
+    .navigationBarTitleDisplayMode(.large)
     .toolbar {
       ToolbarItem(placement: .topBarTrailing) {
         Button {
@@ -108,43 +115,63 @@ struct GalleryView: View {
   }
 }
 
-private struct GalleryRowView: View {
+private struct GalleryGridCard: View {
   let package: CapturePackage
 
   var body: some View {
-    HStack(spacing: 14) {
-      thumbnail
-      VStack(alignment: .leading, spacing: 4) {
+    VStack(alignment: .leading, spacing: 0) {
+      preview
+        .frame(maxWidth: .infinity)
+        .aspectRatio(1, contentMode: .fit)
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(alignment: .topTrailing) {
+          if package.hasPanorama {
+            Image(systemName: "pano.fill")
+              .font(.caption.weight(.bold))
+              .foregroundStyle(.white)
+              .padding(6)
+              .background(.black.opacity(0.55), in: Capsule())
+              .padding(8)
+          }
+        }
+        .overlay {
+          RoundedRectangle(cornerRadius: 14, style: .continuous)
+            .strokeBorder(.white.opacity(0.12), lineWidth: 1)
+        }
+        .shadow(color: .black.opacity(0.35), radius: 8, y: 4)
+
+      VStack(alignment: .leading, spacing: 2) {
         Text(package.manifest.completedAt ?? package.manifest.createdAt, format: .dateTime)
-          .font(.headline)
+          .font(.subheadline.weight(.semibold))
+          .lineLimit(1)
         Text(
-          "\(package.manifest.frames.count) frames · \(package.hasPanorama ? "Panorama ready" : "Not computed")"
+          "\(package.manifest.frames.count) frames · \(package.hasPanorama ? "Ready" : "Raw")"
         )
         .font(.caption)
         .foregroundStyle(.secondary)
+        .lineLimit(1)
       }
+      .padding(.top, 8)
+      .padding(.horizontal, 2)
     }
-    .padding(.vertical, 4)
   }
 
   @ViewBuilder
-  private var thumbnail: some View {
-    if let url = package.firstImageURL,
+  private var preview: some View {
+    if let url = package.previewImageURL,
       let image = UIImage(contentsOfFile: url.path)
     {
       Image(uiImage: image)
         .resizable()
         .scaledToFill()
-        .frame(width: 56, height: 56)
-        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .frame(minWidth: 0, maxWidth: .infinity, minHeight: 0, maxHeight: .infinity)
     } else {
-      RoundedRectangle(cornerRadius: 8)
-        .fill(.secondary.opacity(0.2))
-        .frame(width: 56, height: 56)
-        .overlay {
-          Image(systemName: "photo")
-            .foregroundStyle(.secondary)
-        }
+      ZStack {
+        Color.secondary.opacity(0.18)
+        Image(systemName: "photo")
+          .font(.title)
+          .foregroundStyle(.secondary)
+      }
     }
   }
 }
@@ -197,7 +224,7 @@ struct GalleryDetailView: View {
   @ViewBuilder
   private var previewSection: some View {
     Section {
-      if let url = package.firstImageURL,
+      if let url = package.previewImageURL,
         let image = UIImage(contentsOfFile: url.path)
       {
         Image(uiImage: image)

@@ -23,7 +23,7 @@ actor CapturePackageStore {
     try fileManager.createDirectory(at: imageDirectory, withIntermediateDirectories: true)
 
     let manifest = CaptureSessionManifest(
-      schemaVersion: 5,
+      schemaVersion: 6,
       sessionID: sessionID,
       timestampConvention: "UTC seconds since Unix epoch; sub-millisecond precision preserved",
       createdAt: Date(),
@@ -51,6 +51,7 @@ actor CapturePackageStore {
           "five-band-blend",
         ]
       ),
+      primaryCapture: nil,
       frames: []
     )
 
@@ -68,7 +69,8 @@ actor CapturePackageStore {
     photo: CapturedPhoto,
     target: CaptureTarget,
     pose: CameraPoseMetadata,
-    alignment: AlignmentMetadata
+    alignment: AlignmentMetadata,
+    primaryCapture: PrimaryCaptureMetadata? = nil
   ) throws -> CapturedFrameRecord {
     guard let directory = packageDirectory, var manifest else {
       throw CapturePackageError.sessionNotStarted
@@ -105,6 +107,13 @@ actor CapturePackageStore {
       alignment: alignment
     )
     manifest.frames.append(record)
+    if let primaryCapture {
+      manifest.primaryCapture = PrimaryCaptureMetadata(
+        imageFilename: filename,
+        targetId: primaryCapture.targetId,
+        classifiedRing: primaryCapture.classifiedRing
+      )
+    }
     self.manifest = manifest
     try write(manifest, named: "manifest.json", in: directory)
     return record
@@ -322,5 +331,10 @@ extension CapturePackage {
     return directoryURL
       .appendingPathComponent(manifest.imageDirectory, isDirectory: true)
       .appendingPathComponent(frame.imageFilename)
+  }
+
+  /// Prefer the stitched panorama when available; otherwise the first frame.
+  var previewImageURL: URL? {
+    hasPanorama ? panoramaURL : firstImageURL
   }
 }

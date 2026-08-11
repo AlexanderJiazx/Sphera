@@ -344,6 +344,12 @@ struct EngineInitializationMetadata: Codable, Equatable, Sendable {
   let enabledPipelineStages: [String]
 }
 
+struct PrimaryCaptureMetadata: Codable, Equatable, Sendable {
+  let imageFilename: String
+  let targetId: String
+  let classifiedRing: CaptureRing
+}
+
 struct CaptureSessionManifest: Codable, Equatable, Sendable {
   let schemaVersion: Int
   let sessionID: UUID
@@ -354,6 +360,9 @@ struct CaptureSessionManifest: Codable, Equatable, Sendable {
   let imageDirectory: String
   let coreMotionReferenceFrame: String
   let engineInitialization: EngineInitializationMetadata
+  /// Present on schema 6+ sessions that used a user-triggered primary capture.
+  /// Absent when decoding older packages for backward compatibility.
+  var primaryCapture: PrimaryCaptureMetadata?
   var frames: [CapturedFrameRecord]
 }
 

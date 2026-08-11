@@ -1,4 +1,3 @@
-import AVFoundation
 import Combine
 import Foundation
 import UIKit
@@ -12,7 +11,8 @@ struct CaptureCompletion: Equatable, Sendable {
 enum CaptureWorkflowPhase: Equatable {
   case setup
   case preparing
-  case capturing
+  case awaitingPrimary
+  case capturingPoints
   case saved(CapturePackage)
   case stitching
   case completed(CaptureCompletion)
@@ -24,11 +24,11 @@ final class CaptureViewModel: ObservableObject {
   @Published var configuration = CaptureConfiguration.debugPreset
   @Published private(set) var phase: CaptureWorkflowPhase = .setup
   @Published private(set) var plan = CapturePlan(configuration: .debugPreset)
-  @Published private(set) var currentTargetIndex = 0
   @Published private(set) var capturedFrames: [CapturedFrameRecord] = []
   @Published private(set) var currentMotionSample: MotionSample?
   @Published private(set) var navigationReading = CaptureNavigationReading.unavailable
-  @Published private(set) var navigationInstruction = CaptureNavigationInstruction.preparing
+  @Published private(set) var guidePoints: [CapturePointProjection] = []
+  @Published private(set) var activeTarget: CaptureTarget?
   @Published private(set) var stableHoldProgress = 0.0
   @Published private(set) var isCapturingPhoto = false
   @Published private(set) var statusMessage = "Ready"
@@ -46,7 +46,6 @@ final class CaptureViewModel: ObservableObject {
   private var subscriptions = Set<AnyCancellable>()
   private var captureReference: CaptureReferenceFrame?
   private var alignmentHoldTracker = AlignmentHoldTracker()
-  private var guidanceState = CaptureGuidanceState()
   private var autoCaptureBlockedUntil = 0.0
   private var lastNavigationTraceTimestamp = -Double.infinity
   private let navigationTraceEnabled =
@@ -71,12 +70,12 @@ final class CaptureViewModel: ObservableObject {
       .store(in: &subscriptions)
   }
 
-  var currentTarget: CaptureTarget? {
-    guard plan.targets.indices.contains(currentTargetIndex) else { return nil }
-    return plan.targets[currentTargetIndex]
-  }
-
   var totalFrameCount: Int { plan.targets.count }
+
+  var remainingTargets: [CaptureTarget] {
+    let capturedIDs = Set(capturedFrames.map(\.target.id))
+    return plan.targets.filter { !capturedIDs.contains($0.id) }
+  }
 
   var progressFraction: Double {
     guard totalFrameCount > 0 else { return 0 }
@@ -84,11 +83,15 @@ final class CaptureViewModel: ObservableObject {
   }
 
   func rebuildPlan() {
-    guard phase == .setup else { return }
     configuration.horizontalCount = min(16, max(4, configuration.horizontalCount))
     configuration.downwardCount = min(6, max(4, configuration.downwardCount))
     configuration.upwardCount = min(6, max(4, configuration.upwardCount))
-    plan = CapturePlan(configuration: configuration)
+    switch phase {
+    case .setup, .saved, .completed, .failed:
+      plan = CapturePlan(configuration: configuration)
+    default:
+      break
+    }
   }
 
   func startCapture() {
@@ -98,12 +101,11 @@ final class CaptureViewModel: ObservableObject {
     statusMessage = "Starting camera and motion"
     captureErrorMessage = nil
     capturedFrames = []
-    currentTargetIndex = 0
     navigationReading = .unavailable
-    navigationInstruction = .preparing
+    guidePoints = []
+    activeTarget = nil
     stableHoldProgress = 0
     alignmentHoldTracker.reset()
-    guidanceState.reset()
     autoCaptureBlockedUntil = 0
     captureReference = nil
 
@@ -112,17 +114,13 @@ final class CaptureViewModel: ObservableObject {
         try motion.start()
         try await camera.start()
         _ = try await motion.waitForFirstSample()
-        guard let referenceSample = motion.currentSample else {
-          throw MotionTrackingError.timedOut
-        }
-        captureReference = OrientationMath.makeCaptureReference(from: referenceSample)
-        traceCaptureReferenceIfEnabled()
+        plan = CapturePlan(configuration: configuration)
         _ = try await packageStore.begin(
           plan: plan,
           coreMotionReferenceFrame: motion.referenceFrameName
         )
-        phase = .capturing
-        statusMessage = "Align with target 1 of \(totalFrameCount)"
+        phase = .awaitingPrimary
+        statusMessage = "Frame the first shot, then capture"
       } catch {
         camera.stop()
         motion.stop()
@@ -130,6 +128,41 @@ final class CaptureViewModel: ObservableObject {
         phase = .failed(error.localizedDescription)
         statusMessage = "Capture unavailable"
       }
+    }
+  }
+
+  func capturePrimary() {
+    guard phase == .awaitingPrimary, !isCapturingPhoto else { return }
+    isCapturingPhoto = true
+    captureErrorMessage = nil
+    statusMessage = "Capturing primary"
+    Task {
+      await performPrimaryCapture()
+    }
+  }
+
+  /// Abandons the in-progress session and returns to setup so the Capture tab
+  /// can start a fresh session.
+  func resetCapture() {
+    guard phase == .capturingPoints else { return }
+    camera.stop()
+    motion.stop()
+    isCapturingPhoto = false
+    stitchProgress = nil
+    captureErrorMessage = nil
+    navigationReading = .unavailable
+    guidePoints = []
+    activeTarget = nil
+    stableHoldProgress = 0
+    alignmentHoldTracker.reset()
+    captureReference = nil
+    capturedFrames = []
+    statusMessage = "Resetting capture"
+    Task {
+      await packageStore.abandon()
+      phase = .setup
+      statusMessage = "Ready"
+      plan = CapturePlan(configuration: configuration)
     }
   }
 
@@ -145,12 +178,11 @@ final class CaptureViewModel: ObservableObject {
     stitchProgress = nil
     captureErrorMessage = nil
     navigationReading = .unavailable
-    navigationInstruction = .preparing
+    guidePoints = []
+    activeTarget = nil
     stableHoldProgress = 0
     alignmentHoldTracker.reset()
-    guidanceState.reset()
     captureReference = nil
-    currentTargetIndex = 0
     capturedFrames = []
     plan = CapturePlan(configuration: configuration)
   }
@@ -168,12 +200,11 @@ final class CaptureViewModel: ObservableObject {
     stitchProgress = nil
     captureErrorMessage = nil
     navigationReading = .unavailable
-    navigationInstruction = .preparing
+    guidePoints = []
+    activeTarget = nil
     stableHoldProgress = 0
     alignmentHoldTracker.reset()
-    guidanceState.reset()
     captureReference = nil
-    currentTargetIndex = 0
     capturedFrames = []
     plan = CapturePlan(configuration: configuration)
   }
@@ -291,22 +322,62 @@ final class CaptureViewModel: ObservableObject {
 
   private func handleMotionSample(_ sample: MotionSample?) {
     currentMotionSample = sample
-    guard phase == .capturing,
+    guard phase == .capturingPoints,
       !isCapturingPhoto,
       let sample,
-      let captureReference,
-      let target = currentTarget
+      let captureReference
     else {
+      if phase != .capturingPoints {
+        guidePoints = []
+        activeTarget = nil
+        navigationReading = .unavailable
+      }
       return
     }
 
-    let reading = OrientationMath.navigationReading(
-      sample: sample,
-      captureReference: captureReference,
-      target: target,
-      toleranceDegrees: configuration.alignmentToleranceDegrees
-    )
+    let remaining = remainingTargets
+    let projections = remaining.map { target in
+      OrientationMath.projectTargetToScreen(
+        sample: sample,
+        captureReference: captureReference,
+        target: target
+      )
+    }
+
+    guard
+      let nearest = OrientationMath.nearestTarget(
+        among: remaining,
+        sample: sample,
+        captureReference: captureReference,
+        toleranceDegrees: configuration.alignmentToleranceDegrees
+      )
+    else {
+      guidePoints = projections
+      activeTarget = nil
+      navigationReading = .unavailable
+      stableHoldProgress = 0
+      alignmentHoldTracker.reset()
+      return
+    }
+
+    let reading = nearest.reading
     navigationReading = reading
+    activeTarget = nearest.target
+    guidePoints = projections.map { point in
+      var updated = point
+      if point.targetID == nearest.target.id {
+        updated = CapturePointProjection(
+          targetID: point.targetID,
+          ring: point.ring,
+          offsetX: point.offsetX,
+          offsetY: point.offsetY,
+          directionErrorDegrees: point.directionErrorDegrees,
+          isInFront: point.isInFront,
+          isAligned: reading.isAligned
+        )
+      }
+      return updated
+    }
 
     let holdUpdate = alignmentHoldTracker.update(
       isAligned: reading.isAligned,
@@ -315,37 +386,113 @@ final class CaptureViewModel: ObservableObject {
       blockedUntilTimestamp: autoCaptureBlockedUntil
     )
     stableHoldProgress = holdUpdate.progress
-    navigationInstruction = guidanceState.update(
-      targetID: target.id,
-      reading: reading,
-      toleranceDegrees: configuration.alignmentToleranceDegrees,
-      stableHoldProgress: stableHoldProgress,
-      isReadingAvailable: true,
-      isCapturingPhoto: false
-    )
     traceNavigationIfEnabled(
       sample: sample,
-      target: target,
-      reading: reading,
-      instruction: navigationInstruction
+      target: nearest.target,
+      reading: reading
     )
 
-    guard reading.isAligned else {
-      statusMessage = navigationInstruction.movement.statusMessage
-      return
+    if reading.isAligned {
+      statusMessage =
+        stableHoldProgress < 1
+        ? "Hold on point"
+        : "Capturing"
+    } else {
+      statusMessage =
+        "Align center to a point · \(capturedFrames.count) of \(totalFrameCount)"
     }
 
-    statusMessage = stableHoldProgress < 1 ? "Hold aligned" : "Capturing"
-
-    guard holdUpdate.shouldCapture else { return }
+    guard reading.isAligned, holdUpdate.shouldCapture else { return }
     isCapturingPhoto = true
-    navigationInstruction = .capturing
     Task {
-      await capture(target: target, reference: captureReference)
+      await capture(target: nearest.target, reference: captureReference)
     }
   }
 
-  private func capture(target: CaptureTarget, reference: CaptureReferenceFrame) async {
+  private func performPrimaryCapture() async {
+    do {
+      let photo = try await camera.capturePhoto()
+      let reference = OrientationMath.makeCaptureReference(from: photo.motionSample)
+      captureReference = reference
+      traceCaptureReferenceIfEnabled()
+
+      let pitch = OrientationMath.currentPitchDegrees(
+        sample: photo.motionSample,
+        captureReference: reference
+      )
+      let ring = OrientationMath.classifyCaptureRing(
+        pitchDegrees: pitch,
+        configuration: configuration
+      )
+      guard
+        let target = OrientationMath.closestTarget(
+          in: ring,
+          targets: plan.targets,
+          sample: photo.motionSample,
+          captureReference: reference
+        )
+      else {
+        throw CameraCaptureError.sessionNotConfigured
+      }
+
+      let exposureAlignment = OrientationMath.navigationReading(
+        sample: photo.motionSample,
+        captureReference: reference,
+        target: target,
+        toleranceDegrees: configuration.alignmentToleranceDegrees
+      )
+      let pose = OrientationMath.poseMetadata(
+        sample: photo.motionSample,
+        captureReference: reference,
+        referenceFrameName: motion.referenceFrameName
+      )
+      let record = try await packageStore.append(
+        photo: photo,
+        target: target,
+        pose: pose,
+        alignment: AlignmentMetadata(
+          directionErrorDegrees: exposureAlignment.directionErrorDegrees,
+          yawErrorDegrees: exposureAlignment.yawErrorDegrees,
+          pitchErrorDegrees: exposureAlignment.pitchErrorDegrees,
+          requiredToleranceDegrees: configuration.alignmentToleranceDegrees,
+          requiredStableDurationSeconds: configuration.stableHoldDurationSeconds
+        ),
+        primaryCapture: PrimaryCaptureMetadata(
+          imageFilename: "",
+          targetId: target.id,
+          classifiedRing: ring
+        )
+      )
+
+      capturedFrames.append(record)
+      try await camera.lockExposureFocusWhiteBalance()
+      UINotificationFeedbackGenerator().notificationOccurred(.success)
+      alignmentHoldTracker.reset()
+      stableHoldProgress = 0
+      navigationReading = .unavailable
+      isCapturingPhoto = false
+
+      if capturedFrames.count == totalFrameCount {
+        await finalizeCapture()
+      } else {
+        phase = .capturingPoints
+        statusMessage =
+          "Align center to a point · \(capturedFrames.count) of \(totalFrameCount)"
+      }
+    } catch {
+      isCapturingPhoto = false
+      captureReference = nil
+      alignmentHoldTracker.reset()
+      stableHoldProgress = 0
+      captureErrorMessage = error.localizedDescription
+      statusMessage = "Primary capture failed; try again"
+    }
+  }
+
+  private func capture(
+    target: CaptureTarget,
+    reference: CaptureReferenceFrame
+  ) async {
     captureErrorMessage = nil
     do {
       let photo = try await camera.capturePhoto()
@@ -374,23 +521,22 @@ final class CaptureViewModel: ObservableObject {
       )
       capturedFrames.append(record)
       UINotificationFeedbackGenerator().notificationOccurred(.success)
-      currentTargetIndex += 1
       alignmentHoldTracker.reset()
       stableHoldProgress = 0
       navigationReading = .unavailable
-      navigationInstruction = .preparing
+      activeTarget = nil
       isCapturingPhoto = false
 
       if capturedFrames.count == totalFrameCount {
         await finalizeCapture()
       } else {
-        statusMessage = "Move to target \(currentTargetIndex + 1) of \(totalFrameCount)"
+        statusMessage =
+          "Align center to a point · \(capturedFrames.count) of \(totalFrameCount)"
       }
     } catch {
       isCapturingPhoto = false
       alignmentHoldTracker.reset()
       stableHoldProgress = 0
-      navigationInstruction = .preparing
       autoCaptureBlockedUntil = ProcessInfo.processInfo.systemUptime + 1
       captureErrorMessage = error.localizedDescription
       statusMessage = "Capture failed; realign to retry"
@@ -423,8 +569,7 @@ final class CaptureViewModel: ObservableObject {
   private func traceNavigationIfEnabled(
     sample: MotionSample,
     target: CaptureTarget,
-    reading: CaptureNavigationReading,
-    instruction: CaptureNavigationInstruction
+    reading: CaptureNavigationReading
   ) {
     guard navigationTraceEnabled else { return }
     guard sample.monotonicTimestampSeconds - lastNavigationTraceTimestamp >= 0.25 else {
@@ -432,22 +577,8 @@ final class CaptureViewModel: ObservableObject {
     }
     lastNavigationTraceTimestamp = sample.monotonicTimestampSeconds
     print(
-      "SPHERA_NAV target=\(target.id) yawError=\(reading.yawErrorDegrees.formatted(.number.precision(.fractionLength(1)))) pitchError=\(reading.pitchErrorDegrees.formatted(.number.precision(.fractionLength(1)))) directionError=\(reading.directionErrorDegrees.formatted(.number.precision(.fractionLength(1)))) command=\(String(describing: instruction.movement))"
+      "SPHERA_NAV target=\(target.id) yawError=\(reading.yawErrorDegrees.formatted(.number.precision(.fractionLength(1)))) pitchError=\(reading.pitchErrorDegrees.formatted(.number.precision(.fractionLength(1)))) directionError=\(reading.directionErrorDegrees.formatted(.number.precision(.fractionLength(1)))) aligned=\(reading.isAligned)"
     )
-  }
-}
-
-extension CaptureMovement {
-  fileprivate var statusMessage: String {
-    switch self {
-    case .turnLeft: "Turn left"
-    case .turnRight: "Turn right"
-    case .tiltUp: "Tilt up"
-    case .tiltDown: "Tilt down"
-    case .holdStill: "Hold still"
-    case .capturing: "Capturing"
-    case .preparing: "Reading phone orientation"
-    }
   }
 }
 

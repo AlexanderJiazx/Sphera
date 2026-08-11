@@ -419,13 +419,14 @@ func capturePackagePersistence() async throws {
   }
 
   let package = try await store.finalize()
-  #expect(package.manifest.schemaVersion == 5)
+  #expect(package.manifest.schemaVersion == 6)
   #expect(package.manifest.frames.map(\.sequenceIndex) == [0, 1])
   #expect(package.manifest.frames.map(\.target.id) == plan.targets.reversed().map(\.id))
   #expect(
     package.manifest.frames.map(\.imageFilename) == [
       "000_horizontal_01.jpg", "001_horizontal_00.jpg",
     ])
+  #expect(package.manifest.primaryCapture == nil)
   #expect(package.manifest.engineInitialization.usePosePriors)
   #expect(!package.manifest.engineInitialization.allowGlobalArrangementRediscovery)
   #expect(package.manifest.engineInitialization.placementSource == "recorded")
@@ -698,6 +699,165 @@ extension Double {
 @Test("Alignment tolerance stays at six degrees for sensor-first capture")
 func alignmentToleranceMatchesSensorFirstCap() {
   #expect(CaptureConfiguration.debugPreset.alignmentToleranceDegrees == 6)
+}
+
+@Test("Primary capture ring classification uses pitch midpoints")
+func primaryCaptureRingClassification() {
+  let configuration = CaptureConfiguration.debugPreset
+  #expect(OrientationMath.classifyCaptureRing(pitchDegrees: 0, configuration: configuration) == .horizontal)
+  #expect(OrientationMath.classifyCaptureRing(pitchDegrees: 10, configuration: configuration) == .horizontal)
+  #expect(OrientationMath.classifyCaptureRing(pitchDegrees: -10, configuration: configuration) == .horizontal)
+  #expect(OrientationMath.classifyCaptureRing(pitchDegrees: 30, configuration: configuration) == .upward)
+  #expect(OrientationMath.classifyCaptureRing(pitchDegrees: 55, configuration: configuration) == .upward)
+  #expect(OrientationMath.classifyCaptureRing(pitchDegrees: -30, configuration: configuration) == .downward)
+  #expect(OrientationMath.classifyCaptureRing(pitchDegrees: -55, configuration: configuration) == .downward)
+}
+
+@Test("Primary horizontal capture selects the yaw-zero horizontal slot")
+func primaryHorizontalSelectsClosestSlot() {
+  let plan = CapturePlan(configuration: .debugPreset)
+  let reference = makePortraitCaptureReference()
+  let sample = makeMotionSample(
+    cameraToCaptureReference: OrientationMath.targetCameraToCaptureReference(
+      makeTarget(id: "aim", yaw: 0, pitch: 0)
+    ),
+    captureReference: reference
+  )
+  let ring = OrientationMath.classifyCaptureRing(
+    pitchDegrees: OrientationMath.currentPitchDegrees(
+      sample: sample,
+      captureReference: reference
+    ),
+    configuration: .debugPreset
+  )
+  #expect(ring == .horizontal)
+  let target = OrientationMath.closestTarget(
+    in: ring,
+    targets: plan.targets,
+    sample: sample,
+    captureReference: reference
+  )
+  #expect(target?.id == "horizontal-0")
+}
+
+@Test("Nearest remaining target supports out-of-order selection")
+func nearestRemainingTargetOutOfOrder() throws {
+  let plan = CapturePlan(configuration: .debugPreset)
+  let reference = makePortraitCaptureReference()
+  let remaining = plan.targets.filter { $0.id != "horizontal-0" }
+  let aimed = try #require(remaining.first { $0.id == "horizontal-3" })
+  let sample = makeMotionSample(
+    cameraToCaptureReference: OrientationMath.targetCameraToCaptureReference(aimed),
+    captureReference: reference
+  )
+  let nearest = OrientationMath.nearestTarget(
+    among: remaining,
+    sample: sample,
+    captureReference: reference,
+    toleranceDegrees: 6
+  )
+  #expect(nearest?.target.id == "horizontal-3")
+  #expect(nearest?.reading.isAligned == true)
+
+  let projection = OrientationMath.projectTargetToScreen(
+    sample: sample,
+    captureReference: reference,
+    target: aimed
+  )
+  #expect(projection.isInFront)
+  #expect(abs(projection.offsetX) < 0.05)
+  #expect(abs(projection.offsetY) < 0.05)
+}
+
+@Test("Manifest records primaryCapture without renaming image files")
+func primaryCaptureMetadataPersisted() async throws {
+  let root = FileManager.default.temporaryDirectory
+    .appendingPathComponent("SpheraPrimaryMeta-\(UUID().uuidString)", isDirectory: true)
+  defer { try? FileManager.default.removeItem(at: root) }
+
+  var configuration = CaptureConfiguration.debugPreset
+  configuration.horizontalCount = 2
+  configuration.downwardCount = 0
+  configuration.upwardCount = 0
+  let plan = CapturePlan(configuration: configuration)
+  let reference = makePortraitCaptureReference()
+  let store = CapturePackageStore(captureSessionsRootURL: root)
+  _ = try await store.begin(plan: plan, coreMotionReferenceFrame: "test-frame")
+
+  let target = try #require(plan.targets.first)
+  let photo = makePhoto(sequenceIndex: 0)
+  let pose = OrientationMath.poseMetadata(
+    sample: photo.motionSample,
+    captureReference: reference,
+    referenceFrameName: "test-frame"
+  )
+  let record = try await store.append(
+    photo: photo,
+    target: target,
+    pose: pose,
+    alignment: makeAlignment(configuration: configuration),
+    primaryCapture: PrimaryCaptureMetadata(
+      imageFilename: "ignored.jpg",
+      targetId: target.id,
+      classifiedRing: .horizontal
+    )
+  )
+  #expect(record.imageFilename == "000_horizontal_00.jpg")
+
+  let second = try #require(plan.targets.last)
+  _ = try await store.append(
+    photo: makePhoto(sequenceIndex: 1),
+    target: second,
+    pose: pose,
+    alignment: makeAlignment(configuration: configuration)
+  )
+  let package = try await store.finalize()
+  #expect(package.manifest.schemaVersion == 6)
+  #expect(package.manifest.primaryCapture?.imageFilename == "000_horizontal_00.jpg")
+  #expect(package.manifest.primaryCapture?.targetId == target.id)
+  #expect(package.manifest.primaryCapture?.classifiedRing == .horizontal)
+  #expect(package.manifest.frames.map(\.imageFilename).first == "000_horizontal_00.jpg")
+}
+
+@Test("Schema 5 manifests without primaryCapture still decode")
+func schema5ManifestsRemainDecodable() throws {
+  let plan = CapturePlan(configuration: .debugPreset)
+  let sessionID = UUID()
+  let createdAt = Date(timeIntervalSince1970: 1_700_000_000)
+  let legacy: [String: Any] = [
+    "schemaVersion": 5,
+    "sessionID": sessionID.uuidString,
+    "timestampConvention": "UTC seconds since Unix epoch; sub-millisecond precision preserved",
+    "createdAt": createdAt.timeIntervalSince1970,
+    "completedAt": NSNull(),
+    "plan": try jsonObject(plan),
+    "imageDirectory": "images",
+    "coreMotionReferenceFrame": "xArbitraryZVertical",
+    "engineInitialization": [
+      "placementSource": "recorded",
+      "rotationField": "frames[].pose.cameraToCaptureReferenceRotationMatrix",
+      "usePosePriors": true,
+      "allowGlobalArrangementRediscovery": false,
+      "maximumPoseRefinementDegrees": 6,
+      "refinementPurpose": "test",
+      "enabledPipelineStages": ["sift-matching"],
+    ],
+    "frames": [],
+  ]
+  let data = try JSONSerialization.data(withJSONObject: legacy)
+  let decoder = JSONDecoder()
+  decoder.dateDecodingStrategy = .secondsSince1970
+  let decoded = try decoder.decode(CaptureSessionManifest.self, from: data)
+  #expect(decoded.schemaVersion == 5)
+  #expect(decoded.primaryCapture == nil)
+  #expect(decoded.sessionID == sessionID)
+}
+
+private func jsonObject<T: Encodable>(_ value: T) throws -> Any {
+  let encoder = JSONEncoder()
+  encoder.dateEncodingStrategy = .secondsSince1970
+  let data = try encoder.encode(value)
+  return try JSONSerialization.jsonObject(with: data)
 }
 
 @Test("capture_ref rotation matches diag(1,-1,-1) left-multiply without transpose")

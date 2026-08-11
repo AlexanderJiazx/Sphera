@@ -143,6 +143,72 @@ final class CameraCaptureService: ObservableObject {
     }
   }
 
+  /// Freezes AE/AF/AWB at the current device settings after the primary capture.
+  func lockExposureFocusWhiteBalance() async throws {
+    guard state == .running else {
+      throw CameraCaptureError.sessionNotRunning
+    }
+    try await performOnSessionQueue { [self] in
+      guard let captureDevice else {
+        throw CameraCaptureError.sessionNotConfigured
+      }
+      try Self.lockExposureFocusWhiteBalance(on: captureDevice)
+    }
+  }
+
+  private nonisolated static func lockExposureFocusWhiteBalance(
+    on device: AVCaptureDevice
+  ) throws {
+    do {
+      try device.lockForConfiguration()
+      defer { device.unlockForConfiguration() }
+
+      let duration = device.exposureDuration
+      let iso = device.iso
+      if device.isExposureModeSupported(.custom) {
+        let clampedDuration = min(
+          max(duration, device.activeFormat.minExposureDuration),
+          device.activeFormat.maxExposureDuration
+        )
+        let clampedISO = min(
+          max(iso, device.activeFormat.minISO),
+          device.activeFormat.maxISO
+        )
+        device.setExposureModeCustom(
+          duration: clampedDuration,
+          iso: clampedISO,
+          completionHandler: nil
+        )
+      } else if device.isExposureModeSupported(.locked) {
+        device.exposureMode = .locked
+      }
+
+      let lensPosition = device.lensPosition
+      if device.isLockingFocusWithCustomLensPositionSupported {
+        device.setFocusModeLocked(lensPosition: lensPosition, completionHandler: nil)
+      } else if device.isFocusModeSupported(.locked) {
+        device.focusMode = .locked
+      }
+
+      let gains = device.deviceWhiteBalanceGains
+      if device.isLockingWhiteBalanceWithCustomDeviceGainsSupported {
+        let maxGain = device.maxWhiteBalanceGain
+        let clamped = AVCaptureDevice.WhiteBalanceGains(
+          redGain: min(max(gains.redGain, 1), maxGain),
+          greenGain: min(max(gains.greenGain, 1), maxGain),
+          blueGain: min(max(gains.blueGain, 1), maxGain)
+        )
+        device.setWhiteBalanceModeLocked(with: clamped, completionHandler: nil)
+      } else if device.isWhiteBalanceModeSupported(.locked) {
+        device.whiteBalanceMode = .locked
+      }
+
+      device.isSubjectAreaChangeMonitoringEnabled = false
+    } catch {
+      throw CameraCaptureError.couldNotConfigureDevice(error)
+    }
+  }
+
   private func requestCameraAuthorization() async -> Bool {
     switch AVCaptureDevice.authorizationStatus(for: .video) {
     case .authorized:
