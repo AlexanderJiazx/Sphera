@@ -1,0 +1,11 @@
+{
+  "input_height": 640,
+  "input_width": 480,
+  "coarse_height": 80,
+  "coarse_width": 60,
+  "coarse_stride": 8,
+  "temperature": 0.1,
+  "threshold": 0.2,
+  "border_rm": 2,
+  "model": "loftr_outdoor_coarse"
+}

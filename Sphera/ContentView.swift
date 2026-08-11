@@ -16,7 +16,11 @@ struct ContentView: View {
       case .saved(let package):
         SavedCaptureView(package: package, model: model)
       case .stitching:
-        StatusView(title: "Computing panorama", detail: model.statusMessage)
+        StatusView(
+          title: "Computing panorama",
+          detail: model.statusMessage,
+          progress: model.stitchProgress
+        )
       case .completed(let completion):
         CaptureResultView(completion: completion) {
           model.returnToSetup()
@@ -32,8 +36,25 @@ struct ContentView: View {
       #if DEBUG
         guard !handledDebugLaunchArguments else { return }
         handledDebugLaunchArguments = true
-        if ProcessInfo.processInfo.arguments.contains("--auto-start-capture") {
+        let args = ProcessInfo.processInfo.arguments
+        if args.contains("--auto-start-capture") {
           model.startCapture()
+        }
+        if args.contains("--recompute-first-gallery") {
+          Task {
+            await model.refreshGallery()
+            guard let package = model.galleryPackages.first else {
+              NSLog("LoFTR e2e: no gallery package found")
+              return
+            }
+            NSLog("LoFTR e2e: recomputing %@", package.directoryURL.lastPathComponent)
+            await model.computeOnDevice(package: package, replaceExisting: true)
+            NSLog(
+              "LoFTR e2e: finished phase=%@ status=%@",
+              String(describing: model.phase),
+              model.statusMessage
+            )
+          }
         }
       #endif
     }
@@ -253,11 +274,21 @@ private struct SavedCaptureView: View {
 private struct StatusView: View {
   let title: String
   let detail: String
+  var progress: Double? = nil
 
   var body: some View {
     VStack(spacing: 14) {
-      ProgressView()
-        .controlSize(.large)
+      if let progress {
+        ProgressView(value: min(1, max(0, progress)))
+          .progressViewStyle(.linear)
+          .frame(maxWidth: 280)
+        Text("\(Int((min(1, max(0, progress)) * 100).rounded()))%")
+          .font(.headline.monospacedDigit())
+          .foregroundStyle(.secondary)
+      } else {
+        ProgressView()
+          .controlSize(.large)
+      }
       Text(title)
         .font(.title2.bold())
       Text(detail)

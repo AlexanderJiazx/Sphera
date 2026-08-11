@@ -8,12 +8,28 @@ struct SpheraEngineRequest: Sendable {
   let initialCameraRotations: [Matrix3x3Value]
 }
 
+struct StitchProgress: Equatable, Sendable {
+  /// Overall compute progress in `0...1`.
+  var fraction: Double
+  var message: String
+}
+
+/// Fire-and-forget on purpose: must not `await` the main actor from the stitch
+/// worker or UIKit/CoreML can deadlock the UI at the first progress tick.
+typealias StitchProgressHandler = @Sendable (StitchProgress) -> Void
+
 protocol NativeSpheraEngine: Sendable {
-  func stitch(_ request: SpheraEngineRequest) async throws -> StitchingResult
+  func stitch(
+    _ request: SpheraEngineRequest,
+    progress: StitchProgressHandler?
+  ) async throws -> StitchingResult
 }
 
 protocol PanoramaStitching: Sendable {
-  func stitch(package: CapturePackage) async throws -> StitchingResult
+  func stitch(
+    package: CapturePackage,
+    progress: StitchProgressHandler?
+  ) async throws -> StitchingResult
 }
 
 /// The only boundary between the Swift capture application and the panorama
@@ -31,7 +47,10 @@ actor SpheraEngineAdapter: PanoramaStitching {
     self.fileManager = fileManager
   }
 
-  func stitch(package: CapturePackage) async throws -> StitchingResult {
+  func stitch(
+    package: CapturePackage,
+    progress: StitchProgressHandler? = nil
+  ) async throws -> StitchingResult {
     let outputDirectory = package.directoryURL
       .appendingPathComponent("engine-output", isDirectory: true)
     try fileManager.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
@@ -48,7 +67,10 @@ actor SpheraEngineAdapter: PanoramaStitching {
     )
 
     if let nativeEngine {
-      return try await nativeEngine.stitch(request)
+      // Keep the adapter actor free — all heavy work runs detached.
+      return try await Task.detached(priority: .userInitiated) {
+        try await nativeEngine.stitch(request, progress: progress)
+      }.value
     }
 
     // This also permits a debug build to display an engine result restored

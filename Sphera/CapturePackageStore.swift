@@ -38,11 +38,12 @@ actor CapturePackageStore {
         allowGlobalArrangementRediscovery: true,
         maximumPoseRefinementDegrees: nil,
         refinementPurpose:
-          "Match-based arrangement with locked shared intrinsics and CoreMotion ring pitch prior.",
+          "On-device: match-based arrangement with locked shared intrinsics and CoreMotion ring pitch prior (falls back to recorded poses if the match graph is incomplete). Offline quality: share the capture archive and run Engine scripts/run_hierarchical_loftr.py (compact outdoor LoFTR ~44MB).",
         enabledPipelineStages: [
           "adaptive-ring-layout",
           "feature-matching",
           "homography-camera-estimate",
+          "recorded-pose-fallback",
           "locked-shared-intrinsics",
           "ray-bundle-adjustment",
           "wave-correct",
@@ -91,7 +92,7 @@ actor CapturePackageStore {
       directory
       .appendingPathComponent(manifest.imageDirectory, isDirectory: true)
       .appendingPathComponent(filename)
-    try photo.data.write(to: imageURL, options: [.atomic, .completeFileProtection])
+    try photo.data.write(to: imageURL, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
 
     let record = CapturedFrameRecord(
       id: UUID(),
@@ -213,6 +214,48 @@ actor CapturePackageStore {
     }
   }
 
+  /// Imports a Mac/Engine hierarchical LoFTR (or any) equirectangular result into
+  /// the capture package so the on-device gallery/viewer can display it.
+  func importEnginePanorama(
+    into package: CapturePackage,
+    panoramaURL: URL,
+    reportURL: URL? = nil
+  ) throws {
+    let outputDirectory = package.directoryURL
+      .appendingPathComponent("engine-output", isDirectory: true)
+    try fileManager.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
+
+    let destinationPanorama = outputDirectory
+      .appendingPathComponent("panorama_equirectangular.jpg")
+    if fileManager.fileExists(atPath: destinationPanorama.path) {
+      try fileManager.removeItem(at: destinationPanorama)
+    }
+    try fileManager.copyItem(at: panoramaURL, to: destinationPanorama)
+
+    let destinationReport = outputDirectory.appendingPathComponent("report.json")
+    if fileManager.fileExists(atPath: destinationReport.path) {
+      try fileManager.removeItem(at: destinationReport)
+    }
+    if let reportURL {
+      try fileManager.copyItem(at: reportURL, to: destinationReport)
+    } else {
+      let imported: [String: Any] = [
+        "engine": "sphera-engine-import",
+        "engine_contract_version": 2,
+        "status": "success",
+        "recipe": "imported-hierarchical-loftr-or-external",
+        "output": [
+          "panorama_equirectangular": destinationPanorama.lastPathComponent
+        ],
+      ]
+      let data = try JSONSerialization.data(withJSONObject: imported, options: [.prettyPrinted, .sortedKeys])
+      try data.write(
+        to: destinationReport,
+        options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication]
+      )
+    }
+  }
+
   func makeShareArchive(for package: CapturePackage) throws -> URL {
     try CaptureShareArchive.makeZip(for: package, fileManager: fileManager)
   }
@@ -240,7 +283,7 @@ actor CapturePackageStore {
     let data = try encoder.encode(value)
     try data.write(
       to: directory.appendingPathComponent(filename),
-      options: [.atomic, .completeFileProtection]
+      options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication]
     )
   }
 }

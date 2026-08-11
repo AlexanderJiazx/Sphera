@@ -22,8 +22,12 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdio>
+#include <fstream>
+#include <string>
 #include <stdexcept>
 #include <unordered_map>
+#include <vector>
 
 namespace sphera {
 namespace {
@@ -139,6 +143,7 @@ cv::Mat orthonormalizedRotation(const cv::Mat &input) {
   return rotation;
 }
 
+
 cv::Mat iosToOpenCVRotationY180(const FrameInput &frame) {
   // pose_priors.ios_to_opencv_rotation(..., "y180"): camera-to-world, no
   // transpose. Used only for the CoreMotion pitch prior.
@@ -152,6 +157,11 @@ cv::Mat iosToOpenCVRotationY180(const FrameInput &frame) {
   }
   const cv::Matx33d axisFix(-1, 0, 0, 0, 1, 0, 0, 0, -1);
   return orthonormalizedRotation(captureRotation * cv::Mat(axisFix));
+}
+
+cv::Mat iosToOpenCVRotationY180W2C(const FrameInput &frame) {
+  // OpenCV detail CameraParams.R is world-to-camera (y180_w2c).
+  return orthonormalizedRotation(iosToOpenCVRotationY180(frame).t());
 }
 
 cv::Mat applyExifOrientation(const cv::Mat &encoded, int orientation) {
@@ -193,7 +203,23 @@ cv::Mat loadOrientedImage(const FrameInput &frame) {
   if (encoded.empty()) {
     throw std::runtime_error("OpenCV could not decode " + frame.imageFilename);
   }
-  return applyExifOrientation(encoded, frame.exifOrientation);
+  // Some iOS decoders already honor EXIF despite IGNORE_ORIENTATION. If the
+  // bitmap already matches the calibrated display-oriented size, keep it.
+  if (encoded.cols == frame.intrinsics.referenceWidth &&
+      encoded.rows == frame.intrinsics.referenceHeight) {
+    return encoded;
+  }
+  cv::Mat oriented = applyExifOrientation(encoded, frame.exifOrientation);
+  if (oriented.cols != frame.intrinsics.referenceWidth ||
+      oriented.rows != frame.intrinsics.referenceHeight) {
+    throw std::runtime_error(
+        "Oriented image size does not match calibrated reference for " +
+        frame.imageFilename + " (got " + std::to_string(oriented.cols) + "x" +
+        std::to_string(oriented.rows) + ", expected " +
+        std::to_string(frame.intrinsics.referenceWidth) + "x" +
+        std::to_string(frame.intrinsics.referenceHeight) + ")");
+  }
+  return oriented;
 }
 
 double megapixelScale(cv::Size size, double targetMegapixels) {
@@ -436,6 +462,234 @@ void applyLockedIntrinsics(std::vector<CameraParams> &cameras,
     cameras[index].ppx = frame.intrinsics.cx * frame.workScale;
     cameras[index].ppy = frame.intrinsics.cy * frame.workScale;
   }
+}
+
+std::vector<CameraParams>
+camerasFromRecordedPoses(const std::vector<PreparedFrame> &frames) {
+  std::vector<CameraParams> cameras;
+  cameras.reserve(frames.size());
+  for (const PreparedFrame &frame : frames) {
+    CameraParams camera;
+    cv::Mat rotation32;
+    iosToOpenCVRotationY180W2C(frame.input).convertTo(rotation32, CV_32F);
+    camera.R = rotation32;
+    camera.t = cv::Mat::zeros(3, 1, CV_64F);
+    cameras.push_back(camera);
+  }
+  applyLockedIntrinsics(cameras, frames, true);
+  return cameras;
+}
+
+struct LearnedMatchStats {
+  bool enabled = false;
+  int acceptedPairs = 0;
+  int totalCorrespondences = 0;
+  std::string mode = "unavailable";
+};
+
+LearnedMatchStats applyLoFTRMatchCache(
+    std::vector<ImageFeatures> &features,
+    std::vector<MatchesInfo> &pairwiseMatches,
+    const std::vector<PreparedFrame> &frames,
+    const cv::Mat &topologyMask,
+    const std::filesystem::path &cacheDirectory) {
+  LearnedMatchStats stats;
+  if (cacheDirectory.empty()) {
+    return stats;
+  }
+  const auto manifestPath = cacheDirectory / "manifest.json";
+  if (!std::filesystem::exists(manifestPath)) {
+    return stats;
+  }
+
+  stats.enabled = true;
+  stats.mode = "loftr_outdoor_coarse_augment";
+
+  // Pair files are listed as pair_SS_TT.bin with float32 x0,y0,x1,y1,conf.
+  const int count = static_cast<int>(frames.size());
+  for (int source = 0; source < count; ++source) {
+    for (int target = source + 1; target < count; ++target) {
+      if (!topologyMask.at<uchar>(source, target)) {
+        continue;
+      }
+      char name[64];
+      std::snprintf(name, sizeof(name), "pair_%02d_%02d.bin", source, target);
+      const auto pairPath = cacheDirectory / name;
+      if (!std::filesystem::exists(pairPath)) {
+        continue;
+      }
+      std::ifstream input(pairPath, std::ios::binary);
+      if (!input) {
+        continue;
+      }
+      input.seekg(0, std::ios::end);
+      const std::streamoff bytes = input.tellg();
+      input.seekg(0, std::ios::beg);
+      if (bytes <= 0 || bytes % (5 * sizeof(float)) != 0) {
+        continue;
+      }
+      const int matchCount = static_cast<int>(bytes / (5 * sizeof(float)));
+      std::vector<float> values(static_cast<std::size_t>(matchCount) * 5);
+      input.read(reinterpret_cast<char *>(values.data()), bytes);
+      if (!input) {
+        continue;
+      }
+
+      const double workScale = frames[static_cast<std::size_t>(source)].workScale;
+      // LoFTR cache coordinates are in the 480x640 model input space.
+      constexpr double kLoFTRWidth = 480.0;
+      constexpr double kLoFTRHeight = 640.0;
+      const double srcW = frames[static_cast<std::size_t>(source)].intrinsics.referenceWidth * workScale;
+      const double srcH = frames[static_cast<std::size_t>(source)].intrinsics.referenceHeight * workScale;
+      const double dstW = frames[static_cast<std::size_t>(target)].intrinsics.referenceWidth * workScale;
+      const double dstH = frames[static_cast<std::size_t>(target)].intrinsics.referenceHeight * workScale;
+      const double scaleSrcX = srcW / kLoFTRWidth;
+      const double scaleSrcY = srcH / kLoFTRHeight;
+      const double scaleDstX = dstW / kLoFTRWidth;
+      const double scaleDstY = dstH / kLoFTRHeight;
+
+      std::vector<cv::Point2f> srcPts;
+      std::vector<cv::Point2f> dstPts;
+      srcPts.reserve(static_cast<std::size_t>(matchCount));
+      dstPts.reserve(static_cast<std::size_t>(matchCount));
+      for (int index = 0; index < matchCount; ++index) {
+        const float *row = values.data() + index * 5;
+        srcPts.emplace_back(row[0] * scaleSrcX, row[1] * scaleSrcY);
+        dstPts.emplace_back(row[2] * scaleDstX, row[3] * scaleDstY);
+      }
+      if (srcPts.size() < 8) {
+        continue;
+      }
+
+      // OpenCV stores MatchesInfo::H in image-centre-origin coordinates:
+      // BestOf2NearestMatcher subtracts half the image size from every keypoint
+      // before findHomography, and HomographyBasedEstimator relies on that when
+      // it derives rotations with the principal point at the origin. Fitting in
+      // top-left-origin coordinates injects a half-image translation into every
+      // spanning-tree edge, which is tens of degrees of bogus rotation per edge.
+      const cv::Size sourceSize = features[static_cast<std::size_t>(source)].img_size;
+      const cv::Size targetSize = features[static_cast<std::size_t>(target)].img_size;
+      const cv::Point2f sourceCentre(0.5f * sourceSize.width,
+                                     0.5f * sourceSize.height);
+      const cv::Point2f targetCentre(0.5f * targetSize.width,
+                                     0.5f * targetSize.height);
+      auto centredHomography = [&](const std::vector<cv::Point2f> &from,
+                                   const std::vector<cv::Point2f> &to,
+                                   cv::Mat &mask) {
+        std::vector<cv::Point2f> centredFrom(from.size());
+        std::vector<cv::Point2f> centredTo(to.size());
+        for (std::size_t index = 0; index < from.size(); ++index) {
+          centredFrom[index] = from[index] - sourceCentre;
+          centredTo[index] = to[index] - targetCentre;
+        }
+        return cv::findHomography(centredFrom, centredTo, cv::RANSAC, 3.0, mask);
+      };
+
+      cv::Mat inlierMask;
+      const cv::Mat learnedHomography = centredHomography(srcPts, dstPts, inlierMask);
+      if (learnedHomography.empty() || inlierMask.empty()) {
+        continue;
+      }
+      auto appendKeypoint = [](ImageFeatures &feature, const cv::Point2f &point) {
+        const int index = static_cast<int>(feature.keypoints.size());
+        feature.keypoints.emplace_back(point, 8.0f);
+        cv::Mat descriptors = feature.descriptors.getMat(cv::ACCESS_RW);
+        if (descriptors.empty()) {
+          descriptors = cv::Mat::zeros(1, 128, CV_32F);
+        } else {
+          cv::Mat row = cv::Mat::zeros(1, descriptors.cols, descriptors.type());
+          descriptors.push_back(row);
+        }
+        feature.descriptors = descriptors.getUMat(cv::ACCESS_READ);
+        return index;
+      };
+      // Only the geometrically consistent subset earns a place in the graph.
+      std::vector<cv::DMatch> learnedMatches;
+      learnedMatches.reserve(srcPts.size());
+      int inliers = 0;
+      for (int index = 0; index < static_cast<int>(srcPts.size()); ++index) {
+        if (!inlierMask.at<uchar>(index)) {
+          continue;
+        }
+        ++inliers;
+        const int srcIdx = appendKeypoint(
+            features[static_cast<std::size_t>(source)],
+            srcPts[static_cast<std::size_t>(index)]);
+        const int dstIdx = appendKeypoint(
+            features[static_cast<std::size_t>(target)],
+            dstPts[static_cast<std::size_t>(index)]);
+        learnedMatches.emplace_back(srcIdx, dstIdx, 0.0f);
+      }
+
+      if (inliers < 8) {
+        continue;
+      }
+
+      // Augment rather than replace: keep the SIFT matches for this pair and
+      // refit on the union. Overwriting them let a weak learned pair destroy a
+      // strong SIFT pair, which is how the graph ended up worse than plain SIFT.
+      const std::size_t forwardSlot =
+          static_cast<std::size_t>(source * count + target);
+      std::vector<cv::DMatch> combined = pairwiseMatches[forwardSlot].matches;
+      combined.insert(combined.end(), learnedMatches.begin(),
+                      learnedMatches.end());
+
+      std::vector<cv::Point2f> combinedSrc;
+      std::vector<cv::Point2f> combinedDst;
+      combinedSrc.reserve(combined.size());
+      combinedDst.reserve(combined.size());
+      for (const cv::DMatch &match : combined) {
+        combinedSrc.push_back(features[static_cast<std::size_t>(source)]
+                                  .keypoints[static_cast<std::size_t>(
+                                      match.queryIdx)]
+                                  .pt);
+        combinedDst.push_back(features[static_cast<std::size_t>(target)]
+                                  .keypoints[static_cast<std::size_t>(
+                                      match.trainIdx)]
+                                  .pt);
+      }
+      cv::Mat combinedMask;
+      const cv::Mat homography =
+          centredHomography(combinedSrc, combinedDst, combinedMask);
+      if (homography.empty() || combinedMask.empty()) {
+        continue;
+      }
+      const int combinedInliers = cv::countNonZero(combinedMask);
+      if (combinedInliers < 8) {
+        continue;
+      }
+
+      MatchesInfo info;
+      info.src_img_idx = source;
+      info.dst_img_idx = target;
+      info.matches = combined;
+      info.inliers_mask.assign(combined.size(), 0);
+      for (std::size_t index = 0; index < combined.size(); ++index) {
+        info.inliers_mask[index] =
+            combinedMask.at<uchar>(static_cast<int>(index)) ? 1 : 0;
+      }
+      info.num_inliers = combinedInliers;
+      info.H = homography;
+      info.confidence =
+          std::min(3.0, combinedInliers / (8.0 + 0.3 * combined.size()));
+
+      pairwiseMatches[forwardSlot] = info;
+      MatchesInfo reverse = info;
+      reverse.src_img_idx = target;
+      reverse.dst_img_idx = source;
+      if (!info.H.empty()) {
+        reverse.H = info.H.inv();
+      }
+      for (cv::DMatch &match : reverse.matches) {
+        std::swap(match.queryIdx, match.trainIdx);
+      }
+      pairwiseMatches[static_cast<std::size_t>(target * count + source)] = reverse;
+
+      stats.acceptedPairs += 1;
+      stats.totalCorrespondences += inliers;
+    }
+  }
+  return stats;
 }
 
 bool normalizeWorldOrientation(std::vector<CameraParams> &cameras,
@@ -941,6 +1195,9 @@ void writeReport(const std::vector<PreparedFrame> &frames,
                  const std::vector<int> &ringDirections,
                  const std::vector<int> &ringPitchSigns, int approvedPairCount,
                  bool orientationFlipped,
+                 const std::string &cameraSeed,
+                 const std::string &cameraFallbackReason,
+                 const LearnedMatchStats &learnedStats,
                  const std::vector<PitchPriorRecord> &pitchRecords,
                  const SeamProducts &seams,
                  const std::filesystem::path &panoramaPath,
@@ -986,7 +1243,9 @@ void writeReport(const std::vector<PreparedFrame> &frames,
     report << sign;
   }
   report << "]";
-  report << "pose_placement" << "estimate";
+  report << "pose_placement"
+         << (cameraSeed.find("recorded") != std::string::npos ? "recorded-fallback"
+                                                              : "estimate");
   report << "lock_intrinsics" << true;
   report << "lock_shared_focal" << true;
   report << "bundle_adjust" << true;
@@ -995,7 +1254,9 @@ void writeReport(const std::vector<PreparedFrame> &frames,
   report << "normalize_world_orientation" << true;
   report << "pose_outlier_regularization" << false;
   report << "pitch_prior_weight" << kPitchPriorWeight;
-  report << "learned_match_mode" << "unavailable";
+  report << "learned_match_mode" << learnedStats.mode;
+  report << "learned_accepted_pairs" << learnedStats.acceptedPairs;
+  report << "learned_correspondences" << learnedStats.totalCorrespondences;
   report << "seam_finder" << "graphcut";
   report << "ring_seam_prior" << true;
   report << "ring_seam_overlap_fraction" << kRingSeamOverlapFraction;
@@ -1004,7 +1265,8 @@ void writeReport(const std::vector<PreparedFrame> &frames,
   report << "}";
 
   report << "camera_estimation" << "{";
-  report << "seed" << "homography-estimator";
+  report << "seed" << cameraSeed;
+  report << "fallback_reason" << cameraFallbackReason;
   report << "global_arrangement_rediscovery" << true;
   report << "orientation_flipped" << orientationFlipped;
   report << "approved_topology_pair_count" << approvedPairCount;
@@ -1079,6 +1341,7 @@ StitchArtifacts PanoramaEngine::stitch(const StitchRequest &request) {
 
   std::vector<PreparedFrame> frames = buildAdaptiveLayout(request.frames);
 
+
   std::vector<int> ringSizes;
   std::vector<int> ringDirections;
   std::vector<int> ringPitchSigns;
@@ -1121,46 +1384,93 @@ StitchArtifacts PanoramaEngine::stitch(const StitchRequest &request) {
   (*matcher)(features, pairwiseMatches, topologyMask.getUMat(cv::ACCESS_READ));
   matcher->collectGarbage();
 
-  // Learned/RoMa augment is optional on device and unavailable in this build.
-  // Keep SIFT edges and continue with locked K + pitch prior.
+  const LearnedMatchStats learnedStats = applyLoFTRMatchCache(
+      features, pairwiseMatches, frames, topologyMask,
+      request.learnedMatchCacheDirectory);
+
+  // Prefer LoFTR-augmented SIFT graph. Fall back to CoreMotion poses only if
+  // the match graph still cannot support a full estimate.
+
+  std::string cameraSeed = "homography-estimator";
+  std::string cameraFallbackReason;
+  std::vector<CameraParams> cameras;
+  bool usedMatchEstimate = false;
 
   std::vector<int> component = cv::detail::leaveBiggestComponent(
       features, pairwiseMatches, kConfidenceThreshold);
   if (static_cast<int>(component.size()) != static_cast<int>(frames.size())) {
-    throw std::runtime_error(
+    cameraFallbackReason =
         "Confident match component is missing frames (" +
         std::to_string(component.size()) + "/" +
-        std::to_string(frames.size()) + ")");
-  }
-  for (int index = 0; index < static_cast<int>(frames.size()); ++index) {
-    if (component[static_cast<std::size_t>(index)] != index) {
-      throw std::runtime_error(
-          "Confident match component reordered frames; refusing to drop inputs");
+        std::to_string(frames.size()) + ")";
+  } else {
+    bool reordered = false;
+    for (int index = 0; index < static_cast<int>(frames.size()); ++index) {
+      if (component[static_cast<std::size_t>(index)] != index) {
+        reordered = true;
+        break;
+      }
+    }
+    if (reordered) {
+      cameraFallbackReason =
+          "Confident match component reordered frames; refusing to drop inputs";
+    } else {
+      cv::Ptr<cv::detail::Estimator> estimator =
+          cv::makePtr<cv::detail::HomographyBasedEstimator>();
+      if (!(*estimator)(features, pairwiseMatches, cameras)) {
+        cameraFallbackReason = "OpenCV homography-based camera estimation failed";
+        cameras.clear();
+      } else {
+        for (CameraParams &camera : cameras) {
+          cv::Mat rotation32;
+          camera.R.convertTo(rotation32, CV_32F);
+          camera.R = rotation32;
+        }
+        applyLockedIntrinsics(cameras, frames, true);
+
+        // Keep a copy: if ray BA fails we must NOT throw away the LoFTR-backed
+        // homography cameras and fall back to CoreMotion (that path looks broken).
+        std::vector<CameraParams> camerasBeforeBA = cameras;
+
+        cv::Ptr<cv::detail::BundleAdjusterRay> adjuster =
+            cv::makePtr<cv::detail::BundleAdjusterRay>();
+        adjuster->setConfThresh(kConfidenceThreshold);
+        adjuster->setRefinementMask(cv::Mat::zeros(3, 3, CV_8U));
+        if ((*adjuster)(features, pairwiseMatches, cameras)) {
+          applyLockedIntrinsics(cameras, frames, true);
+          usedMatchEstimate = true;
+          cameraSeed = "homography-estimator+ray-ba";
+        } else {
+          // Retry BA with a softer confidence gate before giving up on matches.
+          cameras = camerasBeforeBA;
+          adjuster->setConfThresh(std::max(0.05f, kConfidenceThreshold * 0.5f));
+          if ((*adjuster)(features, pairwiseMatches, cameras)) {
+            applyLockedIntrinsics(cameras, frames, true);
+            usedMatchEstimate = true;
+            cameraSeed = "homography-estimator+ray-ba-soft";
+            cameraFallbackReason =
+                "Ray BA required a softer confidence threshold after LoFTR augment";
+          } else {
+            cameras = camerasBeforeBA;
+            applyLockedIntrinsics(cameras, frames, true);
+            usedMatchEstimate = true;
+            cameraSeed = "homography-estimator-no-ba";
+            cameraFallbackReason =
+                "OpenCV ray bundle adjustment failed; kept LoFTR/homography cameras";
+          }
+        }
+      }
     }
   }
 
-  cv::Ptr<cv::detail::Estimator> estimator =
-      cv::makePtr<cv::detail::HomographyBasedEstimator>();
-  std::vector<CameraParams> cameras;
-  if (!(*estimator)(features, pairwiseMatches, cameras)) {
-    throw std::runtime_error("OpenCV homography-based camera estimation failed");
-  }
-  for (CameraParams &camera : cameras) {
-    cv::Mat rotation32;
-    camera.R.convertTo(rotation32, CV_32F);
-    camera.R = rotation32;
+  if (!usedMatchEstimate) {
+    if (cameraFallbackReason.empty()) {
+      cameraFallbackReason = "match-based camera estimate unavailable";
+    }
+    cameraSeed = "recorded-device-pose-fallback";
+    cameras = camerasFromRecordedPoses(frames);
   }
 
-  applyLockedIntrinsics(cameras, frames, true);
-
-  cv::Ptr<cv::detail::BundleAdjusterRay> adjuster =
-      cv::makePtr<cv::detail::BundleAdjusterRay>();
-  adjuster->setConfThresh(kConfidenceThreshold);
-  adjuster->setRefinementMask(cv::Mat::zeros(3, 3, CV_8U));
-  if (!(*adjuster)(features, pairwiseMatches, cameras)) {
-    throw std::runtime_error("OpenCV ray bundle adjustment failed");
-  }
-  applyLockedIntrinsics(cameras, frames, true);
 
   std::vector<cv::Mat> waveRotations;
   waveRotations.reserve(cameras.size());
@@ -1175,6 +1485,9 @@ StitchArtifacts PanoramaEngine::stitch(const StitchRequest &request) {
   const bool orientationFlipped =
       normalizeWorldOrientation(cameras, frames, ringPitchSigns);
 
+  // Pitch prior is most useful after match-based estimate. Recorded-pose
+  // fallback already comes from CoreMotion, so keep weight but allow a light
+  // blend for gauge consistency after wave correction.
   const std::vector<PitchPriorRecord> pitchRecords =
       pullRingPitchesFromMetadata(cameras, frames, kPitchPriorWeight);
   applyLockedIntrinsics(cameras, frames, true);
@@ -1199,7 +1512,8 @@ StitchArtifacts PanoramaEngine::stitch(const StitchRequest &request) {
   const double elapsedSeconds =
       (cv::getTickCount() - started) / cv::getTickFrequency();
   writeReport(frames, ringSizes, ringDirections, ringPitchSigns,
-              approvedPairCount, orientationFlipped, pitchRecords, seams,
+              approvedPairCount, orientationFlipped, cameraSeed,
+              cameraFallbackReason, learnedStats, pitchRecords, seams,
               panoramaPath, reportPath, elapsedSeconds, workScale, seamScale,
               composeScale);
   return StitchArtifacts{panoramaPath, reportPath};

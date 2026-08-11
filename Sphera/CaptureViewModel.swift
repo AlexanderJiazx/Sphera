@@ -32,6 +32,7 @@ final class CaptureViewModel: ObservableObject {
   @Published private(set) var stableHoldProgress = 0.0
   @Published private(set) var isCapturingPhoto = false
   @Published private(set) var statusMessage = "Ready"
+  @Published private(set) var stitchProgress: Double?
   @Published private(set) var captureErrorMessage: String?
   @Published private(set) var galleryPackages: [CapturePackage] = []
   @Published private(set) var galleryErrorMessage: String?
@@ -141,6 +142,7 @@ final class CaptureViewModel: ObservableObject {
     }
     phase = .setup
     statusMessage = "Ready"
+    stitchProgress = nil
     captureErrorMessage = nil
     navigationReading = .unavailable
     navigationInstruction = .preparing
@@ -163,6 +165,7 @@ final class CaptureViewModel: ObservableObject {
     isCapturingPhoto = false
     phase = .setup
     statusMessage = "Ready"
+    stitchProgress = nil
     captureErrorMessage = nil
     navigationReading = .unavailable
     navigationInstruction = .preparing
@@ -188,6 +191,7 @@ final class CaptureViewModel: ObservableObject {
 
   func computeOnDevice(package: CapturePackage, replaceExisting: Bool = false) async {
     phase = .stitching
+    stitchProgress = 0
     statusMessage = replaceExisting
       ? "Recomputing panorama on device"
       : "Computing panorama on device"
@@ -198,7 +202,14 @@ final class CaptureViewModel: ObservableObject {
       if replaceExisting {
         try await packageStore.clearEngineOutput(for: package)
       }
-      let result = try await stitcher.stitch(package: package)
+      let result = try await stitcher.stitch(package: package) { [weak self] update in
+        Task { @MainActor in
+          guard let self else { return }
+          self.stitchProgress = update.fraction
+          self.statusMessage = update.message
+        }
+      }
+      stitchProgress = 1
       phase = .completed(
         CaptureCompletion(
           package: package,
@@ -209,6 +220,7 @@ final class CaptureViewModel: ObservableObject {
       statusMessage = "Panorama complete"
       await refreshGallery()
     } catch {
+      stitchProgress = nil
       phase = .completed(
         CaptureCompletion(
           package: package,
@@ -231,8 +243,49 @@ final class CaptureViewModel: ObservableObject {
     }
   }
 
+  func importEnginePanorama(
+    into package: CapturePackage,
+    panoramaURL: URL,
+    reportURL: URL? = nil
+  ) async {
+    do {
+      let accessing = panoramaURL.startAccessingSecurityScopedResource()
+      defer {
+        if accessing {
+          panoramaURL.stopAccessingSecurityScopedResource()
+        }
+      }
+      var reportAccessing = false
+      if let reportURL {
+        reportAccessing = reportURL.startAccessingSecurityScopedResource()
+      }
+      defer {
+        if reportAccessing, let reportURL {
+          reportURL.stopAccessingSecurityScopedResource()
+        }
+      }
+      try await packageStore.importEnginePanorama(
+        into: package,
+        panoramaURL: panoramaURL,
+        reportURL: reportURL
+      )
+      galleryErrorMessage = nil
+      await refreshGallery()
+    } catch {
+      galleryErrorMessage = error.localizedDescription
+    }
+  }
+
   func makeShareArchive(for package: CapturePackage) async throws -> URL {
     try await packageStore.makeShareArchive(for: package)
+  }
+
+  func reportGalleryError(_ message: String) {
+    galleryErrorMessage = message
+  }
+
+  func clearGalleryError() {
+    galleryErrorMessage = nil
   }
 
   private func handleMotionSample(_ sample: MotionSample?) {

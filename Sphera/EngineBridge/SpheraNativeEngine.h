@@ -23,8 +23,9 @@ typedef void (^SpheraNativeStitchCompletion)(
 
 + (void)stitchManifestAtURL:(NSURL *)manifestURL
         outputDirectoryURL:(NSURL *)outputDirectoryURL
+         matchCacheDirectoryURL:(NSURL *_Nullable)matchCacheDirectoryURL
                 completion:(SpheraNativeStitchCompletion)completion
-    NS_SWIFT_NAME(stitch(manifestURL:outputDirectoryURL:completion:));
+    NS_SWIFT_NAME(stitch(manifestURL:outputDirectoryURL:matchCacheDirectoryURL:completion:));
 
 @end
 

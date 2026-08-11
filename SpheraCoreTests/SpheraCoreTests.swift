@@ -528,8 +528,12 @@ func engineHandoff() async throws {
 private actor RecordingNativeEngine: NativeSpheraEngine {
   private(set) var lastRequest: SpheraEngineRequest?
 
-  func stitch(_ request: SpheraEngineRequest) async throws -> StitchingResult {
+  func stitch(
+    _ request: SpheraEngineRequest,
+    progress: StitchProgressHandler?
+  ) async throws -> StitchingResult {
     lastRequest = request
+    progress?(StitchProgress(fraction: 1, message: "Done"))
     return StitchingResult(
       panoramaURL: request.outputDirectoryURL.appendingPathComponent("panorama.jpg"),
       reportURL: nil

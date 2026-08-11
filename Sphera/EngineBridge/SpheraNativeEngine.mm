@@ -238,9 +238,11 @@ NSError *nativeError(NSString *description) {
 
 + (void)stitchManifestAtURL:(NSURL *)manifestURL
         outputDirectoryURL:(NSURL *)outputDirectoryURL
+         matchCacheDirectoryURL:(NSURL *)matchCacheDirectoryURL
                 completion:(SpheraNativeStitchCompletion)completion {
   NSURL *manifestCopy = [manifestURL copy];
   NSURL *outputCopy = [outputDirectoryURL copy];
+  NSURL *matchCacheCopy = [matchCacheDirectoryURL copy];
   SpheraNativeStitchCompletion completionCopy = [completion copy];
 
   dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
@@ -250,6 +252,9 @@ NSError *nativeError(NSString *description) {
       try {
         sphera::StitchRequest request =
             parseRequest(manifestCopy, outputCopy);
+        if (matchCacheCopy != nil) {
+          request.learnedMatchCacheDirectory = fileSystemPath(matchCacheCopy);
+        }
         sphera::StitchArtifacts artifacts =
             sphera::PanoramaEngine::stitch(request);
         NSURL *panoramaURL = [NSURL
@@ -266,8 +271,27 @@ NSError *nativeError(NSString *description) {
       } catch (const std::exception &exception) {
         NSString *description =
             [NSString stringWithUTF8String:exception.what()];
-        error =
-            nativeError(description ?: @"The native panorama engine failed.");
+        if (description.length == 0) {
+          description = @"The native panorama engine failed.";
+        }
+        @try {
+          NSDictionary *failureReport = @{
+            @"engine" : @"sphera-ios-native",
+            @"engine_contract_version" : @2,
+            @"status" : @"error",
+            @"error" : description,
+          };
+          NSData *json = [NSJSONSerialization dataWithJSONObject:failureReport
+                                                         options:NSJSONWritingPrettyPrinted
+                                                           error:nil];
+          if (json != nil) {
+            NSURL *reportURL =
+                [outputCopy URLByAppendingPathComponent:@"report.json"];
+            [json writeToURL:reportURL atomically:YES];
+          }
+        } @catch (__unused NSException *reportException) {
+        }
+        error = nativeError(description);
       } catch (...) {
         error = nativeError(
             @"The native panorama engine failed with an unknown error.");

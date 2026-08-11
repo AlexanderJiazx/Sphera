@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import UniformTypeIdentifiers
 
 struct GalleryView: View {
   @ObservedObject var model: CaptureViewModel
@@ -70,6 +71,17 @@ struct GalleryView: View {
       Button("OK", role: .cancel) {}
     } message: {
       Text(shareErrorMessage ?? "")
+    }
+    .alert(
+      "Gallery error",
+      isPresented: Binding(
+        get: { model.galleryErrorMessage != nil },
+        set: { if !$0 { model.clearGalleryError() } }
+      )
+    ) {
+      Button("OK", role: .cancel) {}
+    } message: {
+      Text(model.galleryErrorMessage ?? "")
     }
     .overlay {
       if isPreparingShare {
@@ -145,120 +157,192 @@ struct GalleryDetailView: View {
   @Environment(\.dismiss) private var dismiss
   @State private var isSharing = false
   @State private var showRecomputeConfirmation = false
+  @State private var showEngineImportPicker = false
 
   var body: some View {
+    detailList
+      .navigationTitle("Capture")
+      .navigationBarTitleDisplayMode(.inline)
+      .confirmationDialog(
+        "Recompute panorama?",
+        isPresented: $showRecomputeConfirmation,
+        titleVisibility: .visible
+      ) {
+        Button("Recompute") {
+          Task {
+            await model.computeOnDevice(package: package, replaceExisting: true)
+          }
+        }
+        Button("Cancel", role: .cancel) {}
+      } message: {
+        Text("This replaces the existing on-device panorama with a fresh stitch of the saved frames.")
+      }
+      .fileImporter(
+        isPresented: $showEngineImportPicker,
+        allowedContentTypes: [.jpeg, .json],
+        allowsMultipleSelection: true,
+        onCompletion: handleEngineImport
+      )
+  }
+
+  private var detailList: some View {
     List {
-      Section {
-        if let url = package.firstImageURL,
-          let image = UIImage(contentsOfFile: url.path)
-        {
-          Image(uiImage: image)
-            .resizable()
-            .scaledToFit()
-            .frame(maxWidth: .infinity)
-            .listRowInsets(EdgeInsets())
-        }
-      }
+      previewSection
+      captureMetadataSection
+      framesSection
+      actionsSection
+    }
+  }
 
-      Section("Capture") {
-        LabeledContent("Frames", value: "\(package.manifest.frames.count)")
-        LabeledContent(
-          "Saved",
-          value: (package.manifest.completedAt ?? package.manifest.createdAt)
-            .formatted(date: .abbreviated, time: .shortened)
-        )
-        LabeledContent(
-          "On-device panorama",
-          value: package.hasPanorama ? "Ready" : "Not computed"
-        )
-        LabeledContent("Motion frame", value: package.manifest.coreMotionReferenceFrame)
+  @ViewBuilder
+  private var previewSection: some View {
+    Section {
+      if let url = package.firstImageURL,
+        let image = UIImage(contentsOfFile: url.path)
+      {
+        Image(uiImage: image)
+          .resizable()
+          .scaledToFit()
+          .frame(maxWidth: .infinity)
+          .listRowInsets(EdgeInsets())
       }
+    }
+  }
 
-      Section("Frames") {
-        ForEach(package.manifest.frames) { frame in
-          VStack(alignment: .leading, spacing: 4) {
-            Text("\(frame.sequenceIndex + 1). \(frame.target.ring.displayName) \(frame.target.ringIndex + 1)")
-              .font(.headline)
-            Text(
-              "Yaw \(frame.target.yawDegrees, format: .number.precision(.fractionLength(1)))° · Pitch \(frame.target.pitchDegrees, format: .number.precision(.fractionLength(1)))°"
-            )
-            .font(.caption)
-            .foregroundStyle(.secondary)
-            Text(
-              "Pose + gyro recorded · alignment \(frame.alignment.directionErrorDegrees, format: .number.precision(.fractionLength(2)))°"
-            )
-            .font(.caption2)
-            .foregroundStyle(.secondary)
-          }
-          .padding(.vertical, 2)
-        }
-      }
+  private var captureMetadataSection: some View {
+    Section("Capture") {
+      LabeledContent("Frames", value: "\(package.manifest.frames.count)")
+      LabeledContent(
+        "Saved",
+        value: (package.manifest.completedAt ?? package.manifest.createdAt)
+          .formatted(date: .abbreviated, time: .shortened)
+      )
+      LabeledContent(
+        "On-device panorama",
+        value: package.hasPanorama ? "Ready" : "Not computed"
+      )
+      LabeledContent("Motion frame", value: package.manifest.coreMotionReferenceFrame)
+    }
+  }
 
-      Section {
-        Button {
-          Task {
-            isSharing = true
-            await onShare()
-            isSharing = false
-          }
-        } label: {
-          Label(
-            isSharing ? "Preparing archive…" : "Share capture archive",
-            systemImage: "square.and.arrow.up"
+  private var framesSection: some View {
+    Section("Frames") {
+      ForEach(package.manifest.frames) { frame in
+        VStack(alignment: .leading, spacing: 4) {
+          Text("\(frame.sequenceIndex + 1). \(frame.target.ring.displayName) \(frame.target.ringIndex + 1)")
+            .font(.headline)
+          Text(
+            "Yaw \(frame.target.yawDegrees, format: .number.precision(.fractionLength(1)))° · Pitch \(frame.target.pitchDegrees, format: .number.precision(.fractionLength(1)))°"
           )
+          .font(.caption)
+          .foregroundStyle(.secondary)
+          Text(
+            "Pose + gyro recorded · alignment \(frame.alignment.directionErrorDegrees, format: .number.precision(.fractionLength(2)))°"
+          )
+          .font(.caption2)
+          .foregroundStyle(.secondary)
         }
-        .disabled(isSharing)
-
-        if package.hasPanorama {
-          NavigationLink {
-            PanoramaViewer(imageURL: package.panoramaURL)
-              .navigationTitle("Panorama")
-              .navigationBarTitleDisplayMode(.inline)
-          } label: {
-            Label("View panorama", systemImage: "pano")
-          }
-
-          Button {
-            showRecomputeConfirmation = true
-          } label: {
-            Label("Recompute panorama", systemImage: "arrow.triangle.2.circlepath")
-          }
-        } else {
-          Button {
-            Task {
-              await model.computeOnDevice(package: package)
-            }
-          } label: {
-            Label("Compute on device", systemImage: "cpu")
-          }
-        }
-
-        Button(role: .destructive) {
-          Task {
-            await model.deleteFromGallery(package)
-            dismiss()
-          }
-        } label: {
-          Label("Delete capture", systemImage: "trash")
-        }
+        .padding(.vertical, 2)
       }
     }
-    .navigationTitle("Capture")
-    .navigationBarTitleDisplayMode(.inline)
-    .confirmationDialog(
-      "Recompute panorama?",
-      isPresented: $showRecomputeConfirmation,
-      titleVisibility: .visible
-    ) {
-      Button("Recompute") {
+  }
+
+  private var actionsSection: some View {
+    Section {
+      Button {
         Task {
-          await model.computeOnDevice(package: package, replaceExisting: true)
+          isSharing = true
+          await onShare()
+          isSharing = false
         }
+      } label: {
+        Label(
+          isSharing ? "Preparing archive…" : "Share capture archive",
+          systemImage: "square.and.arrow.up"
+        )
       }
-      Button("Cancel", role: .cancel) {}
-    } message: {
-      Text("This replaces the existing on-device panorama with a fresh stitch of the saved frames.")
+      .disabled(isSharing)
+
+      Button {
+        showEngineImportPicker = true
+      } label: {
+        Label("Import Engine panorama", systemImage: "square.and.arrow.down.on.square")
+      }
+
+      panoramaActions
+
+      Button(role: .destructive) {
+        Task {
+          await model.deleteFromGallery(package)
+          dismiss()
+        }
+      } label: {
+        Label("Delete capture", systemImage: "trash")
+      }
+    } footer: {
+      Text(
+        "For highest quality, share the archive to a Mac and run Engine scripts/run_hierarchical_loftr.py (compact outdoor LoFTR, ~44 MB), then import panorama_equirectangular.jpg here."
+      )
     }
+  }
+
+  @ViewBuilder
+  private var panoramaActions: some View {
+    if package.hasPanorama {
+      NavigationLink {
+        PanoramaViewer(imageURL: package.panoramaURL)
+          .navigationTitle("Panorama")
+          .navigationBarTitleDisplayMode(.inline)
+      } label: {
+        Label("View panorama", systemImage: "pano")
+      }
+
+      Button {
+        showRecomputeConfirmation = true
+      } label: {
+        Label("Recompute panorama", systemImage: "arrow.triangle.2.circlepath")
+      }
+    } else {
+      Button {
+        Task {
+          await model.computeOnDevice(package: package)
+        }
+      } label: {
+        Label("Compute on device", systemImage: "cpu")
+      }
+    }
+  }
+
+  private func handleEngineImport(_ result: Result<[URL], Error>) {
+    switch result {
+    case .success(let urls):
+      let panorama = urls.first(where: isJPEGURL)
+      let report = urls.first(where: isJSONURL)
+      guard let panorama else {
+        model.reportGalleryError(
+          "Select panorama_equirectangular.jpg (optional report.json)."
+        )
+        return
+      }
+      Task {
+        await model.importEnginePanorama(
+          into: package,
+          panoramaURL: panorama,
+          reportURL: report
+        )
+      }
+    case .failure(let error):
+      model.reportGalleryError(error.localizedDescription)
+    }
+  }
+
+  private func isJPEGURL(_ url: URL) -> Bool {
+    let ext = url.pathExtension.lowercased()
+    return ext == "jpg" || ext == "jpeg"
+  }
+
+  private func isJSONURL(_ url: URL) -> Bool {
+    url.pathExtension.lowercased() == "json"
   }
 }
 

@@ -43,6 +43,8 @@ struct FrameInput {
 struct StitchRequest {
   std::vector<FrameInput> frames;
   std::filesystem::path outputDirectory;
+  /// Optional on-device LoFTR match cache directory (manifest.json + pair bins).
+  std::filesystem::path learnedMatchCacheDirectory;
 };
 
 struct StitchArtifacts {
@@ -50,8 +52,7 @@ struct StitchArtifacts {
   std::filesystem::path reportPath;
 };
 
-/// iOS-native outdoor stitch recipe:
-/// match-based estimate + locked shared intrinsics + CoreMotion ring pitch prior.
+/// iOS-native outdoor stitch recipe with optional on-device LoFTR augment.
 class PanoramaEngine final {
 public:
   static StitchArtifacts stitch(const StitchRequest &request);

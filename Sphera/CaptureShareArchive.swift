@@ -42,6 +42,30 @@ enum CaptureShareArchive {
       entries.append((name: "metadata/\(sidecarName)", data: frameMetadata))
     }
 
+    let recipe = """
+    # Sphera Engine hierarchical LoFTR recipe
+
+    On-device OpenCV can stitch without neural models. For the compact-LoFTR
+    hierarchical quality path (~44 MB outdoor weights, competitive with full RoMa):
+
+    1. Unzip this archive and prepare display-oriented images if needed.
+    2. From the Engine repo root:
+
+    ```bash
+    .venv/bin/python scripts/run_hierarchical_loftr.py \\
+      path/to/images_stitched \\
+      outputs/from_iphone_hierarchical \\
+      --capture-metadata path/to/sphera-engine-request.json \\
+      --ml-python .venv-ml/bin/python
+    ```
+
+    3. Import `panorama_equirectangular.jpg` (and optional `report.json`) back
+       into the iOS gallery via **Import Engine panorama**.
+    """
+    if let recipeData = recipe.data(using: .utf8) {
+      entries.append((name: "ENGINE_HIERARCHICAL_RECIPE.md", data: recipeData))
+    }
+
     try ZipWriter.write(entries: entries, to: zipURL)
     return zipURL
   }
