@@ -38,7 +38,7 @@ actor CapturePackageStore {
         allowGlobalArrangementRediscovery: false,
         maximumPoseRefinementDegrees: 6,
         refinementPurpose:
-          "On-device sensor-first S1: recorded capture_ref poses with per-frame locked intrinsics, pose-overlap SIFT pairs, bounded sensor-anchored refinement (6° cap), adaptive periodic ring seam, and five-band blend. LoFTR remains an optional offline diagnostic only.",
+          "On-device sensor-first S1 polar-cube v2: recorded capture_ref poses with per-frame locked intrinsics, pose-overlap SIFT pairs, bounded sensor-anchored refinement (6° cap), adaptive periodic ring ownership, connected exposure, concurrent ring-local graph cuts, five-band blend, and projection-native zenith composition. LoFTR remains an optional offline diagnostic only.",
         enabledPipelineStages: [
           "manifest-canonicalize",
           "pose-overlap-graph",
@@ -46,9 +46,11 @@ actor CapturePackageStore {
           "sift-matching",
           "sensor-anchored-refinement",
           "adaptive-periodic-ring-seam",
-          "structure-aware-graph-cut",
           "exposure-gain-blocks",
+          "concurrent-ring-local-structure-graph-cut",
           "five-band-blend",
+          "projection-native-top-cube-face",
+          "residual-direct-sphere-fill",
         ]
       ),
       primaryCapture: nil,

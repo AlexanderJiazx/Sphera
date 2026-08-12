@@ -114,10 +114,15 @@ sphera::StitchRequest loadRequest(const std::filesystem::path &captureDir,
   request.outputDirectory = outputDir;
   request.enableLegacyLearnedMatches = false;
 
+  // Restrict the intentionally small scanner to the frames array. Newer
+  // manifests also contain primaryCapture.imageFilename, which is a summary
+  // record rather than a stitch input and has no sequenceIndex.
+  const std::size_t framesEnd = json.find("\"primaryCapture\"");
   std::size_t cursor = 0;
   while (true) {
     const std::size_t framePos = json.find("\"imageFilename\"", cursor);
-    if (framePos == std::string::npos) {
+    if (framePos == std::string::npos ||
+        (framesEnd != std::string::npos && framePos >= framesEnd)) {
       break;
     }
     sphera::FrameInput frame;

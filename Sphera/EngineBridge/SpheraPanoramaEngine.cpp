@@ -28,6 +28,7 @@
 #include <cmath>
 #include <cstdio>
 #include <fstream>
+#include <future>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
@@ -36,8 +37,10 @@
 namespace sphera {
 namespace {
 
-constexpr const char *kPipelineVersion = "sensor_first_s1_adaptive_ring_seam_v1";
-constexpr const char *kRecipe = "sensor_first_s1_adaptive_ring_seam";
+constexpr const char *kPipelineVersion =
+    "sensor_first_s1_adaptive_ring_seam_polar_cube_v2";
+constexpr const char *kRecipe =
+    "sensor_first_s1_adaptive_ring_seam_polar_cube";
 constexpr double kWorkMegapixels = 1.0;
 constexpr double kSeamMegapixels = 0.12;
 constexpr int kComposeSourceMaximumDimension = 2048;
@@ -49,6 +52,11 @@ constexpr double kRingSeamOverlapFraction = 0.25;
 constexpr double kPeriodicBlendPaddingFraction = 0.08;
 constexpr int kSeamDilateIterations = 1;
 constexpr int kStructureBlendBands = 5;
+constexpr int kPolarCubeSeamSize = 256;
+constexpr int kPolarCubeComposeSize = 1024;
+constexpr double kPolarCubeFieldOfViewDegrees = 100.0;
+constexpr double kPolarCubeFullLatitudeDegrees = 78.0;
+constexpr double kPolarCubeMinimumLatitudeDegrees = 69.0;
 constexpr double kPi = 3.14159265358979323846;
 
 using cv::detail::CameraParams;
@@ -353,12 +361,15 @@ StitchArtifacts PanoramaEngine::stitch(const StitchRequest &request) {
   reportProgress(request, 0.08, "Pose-overlap graph");
   const int approvedPairCount =
       static_cast<int>(graph.report.selectedPairs.size());
+  const double manifestAndPoseGraphSeconds =
+      (cv::getTickCount() - started) / cv::getTickFrequency();
 
   std::vector<ImageFeatures> features(frames.size());
   cv::Ptr<cv::SIFT> featureFinder =
       cv::SIFT::create(kMaximumFeatures, 3, kSiftContrastThreshold, 15, 1.6);
   std::vector<cv::Size> workSizes(frames.size());
 
+  const int64 siftStarted = cv::getTickCount();
   reportProgress(request, 0.12, "SIFT matching");
   for (std::size_t index = 0; index < frames.size(); ++index) {
     cv::Mat fullImage = loadOrientedImage(frames[index].input);
@@ -379,6 +390,8 @@ StitchArtifacts PanoramaEngine::stitch(const StitchRequest &request) {
   std::vector<MatchesInfo> pairwiseMatches;
   (*matcher)(features, pairwiseMatches, graph.mask.getUMat(cv::ACCESS_READ));
   matcher->collectGarbage();
+  const double siftSeconds =
+      (cv::getTickCount() - siftStarted) / cv::getTickFrequency();
 
   if (request.enableLegacyLearnedMatches &&
       !request.learnedMatchCacheDirectory.empty()) {
@@ -398,6 +411,7 @@ StitchArtifacts PanoramaEngine::stitch(const StitchRequest &request) {
     ringSizes[index] = frames[index].layout.ringSize;
   }
 
+  const int64 refinementStarted = cv::getTickCount();
   reportProgress(request, 0.35, "Sensor-anchored refinement");
   auto constraintResult = buildSensorRayConstraintsFromSift(
       cameras, features, pairwiseMatches, workSizes, graph.mask, graph.overlap,
@@ -449,7 +463,10 @@ StitchArtifacts PanoramaEngine::stitch(const StitchRequest &request) {
 
   features.clear();
   pairwiseMatches.clear();
+  const double refinementSeconds =
+      (cv::getTickCount() - refinementStarted) / cv::getTickFrequency();
 
+  const int64 seamStageStarted = cv::getTickCount();
   reportProgress(request, 0.55, "Adaptive ring seam");
   const int frameCount = static_cast<int>(frames.size());
   const double seamWorkAspect = seamScale / workScale;
@@ -464,6 +481,7 @@ StitchArtifacts PanoramaEngine::stitch(const StitchRequest &request) {
   std::vector<PoseFrameLayout> layouts;
   layouts.reserve(static_cast<std::size_t>(frameCount));
 
+  const int64 seamWarpStarted = cv::getTickCount();
   for (int index = 0; index < frameCount; ++index) {
     cv::Mat fullImage =
         loadOrientedImage(frames[static_cast<std::size_t>(index)].input);
@@ -484,17 +502,30 @@ StitchArtifacts PanoramaEngine::stitch(const StitchRequest &request) {
     warpedMasks[static_cast<std::size_t>(index)] = maskU.getMat(cv::ACCESS_READ).clone();
     layouts.push_back(frames[static_cast<std::size_t>(index)].layout);
   }
+  const double seamWarpSeconds =
+      (cv::getTickCount() - seamWarpStarted) / cv::getTickFrequency();
 
+  // Exposure compensation needs the complete geometric overlap graph.  The
+  // adaptive ring prior deliberately removes most cross-ring overlap before
+  // graph cut; feeding those restricted masks to the compensator disconnects
+  // the upper, horizon, and lower photometric solves.
+  const std::vector<cv::Mat> exposureMasks = warpedMasks;
+  const int64 ringPriorStarted = cv::getTickCount();
   auto adaptive = applyAdaptiveRingSeamPriors(
       warpedMasks, corners, warpedImages, layouts, kRingSeamOverlapFraction);
   warpedMasks = adaptive.first;
   AdaptiveRingSeamReport seamReport = adaptive.second;
+  const double ringPriorSeconds =
+      (cv::getTickCount() - ringPriorStarted) / cv::getTickFrequency();
 
   std::vector<cv::UMat> warpedImagesU(static_cast<std::size_t>(frameCount));
+  std::vector<cv::UMat> exposureMasksU(static_cast<std::size_t>(frameCount));
   std::vector<cv::UMat> seamMasksU(static_cast<std::size_t>(frameCount));
   for (int index = 0; index < frameCount; ++index) {
     warpedImages[static_cast<std::size_t>(index)].copyTo(
         warpedImagesU[static_cast<std::size_t>(index)]);
+    exposureMasks[static_cast<std::size_t>(index)].copyTo(
+        exposureMasksU[static_cast<std::size_t>(index)]);
     warpedMasks[static_cast<std::size_t>(index)].copyTo(
         seamMasksU[static_cast<std::size_t>(index)]);
   }
@@ -503,12 +534,15 @@ StitchArtifacts PanoramaEngine::stitch(const StitchRequest &request) {
       cv::detail::ExposureCompensator::createDefault(
           cv::detail::ExposureCompensator::GAIN_BLOCKS);
   std::string exposureStatus = "gain-blocks";
+  const int64 exposureStarted = cv::getTickCount();
   try {
-    compensator->feed(corners, warpedImagesU, seamMasksU);
+    compensator->feed(corners, warpedImagesU, exposureMasksU);
   } catch (const cv::Exception &) {
     compensator = cv::makePtr<cv::detail::NoExposureCompensator>();
     exposureStatus = "disabled-after-open-cv-error";
   }
+  const double exposureSeconds =
+      (cv::getTickCount() - exposureStarted) / cv::getTickFrequency();
 
   std::vector<cv::UMat> floatingImages(static_cast<std::size_t>(frameCount));
   for (int index = 0; index < frameCount; ++index) {
@@ -516,24 +550,93 @@ StitchArtifacts PanoramaEngine::stitch(const StitchRequest &request) {
     proxy.convertTo(floatingImages[static_cast<std::size_t>(index)], CV_32F);
   }
 
-  std::string seamStatus = "graphcut-color-structure-proxy-with-adaptive-ring-seam";
+  std::string seamStatus =
+      "ring-local-graphcut-color-structure-proxy-with-adaptive-ring-seam";
+  const int64 graphCutStarted = cv::getTickCount();
+  std::vector<std::pair<int, double>> graphCutRingSeconds;
   try {
-    cv::detail::GraphCutSeamFinder seamFinder(
-        cv::detail::GraphCutSeamFinderBase::COST_COLOR);
-    seamFinder.find(floatingImages, corners, seamMasksU);
+    struct RingGraphCutResult {
+      int ringId = 0;
+      std::vector<int> indices;
+      std::vector<cv::UMat> masks;
+      double elapsedSeconds = 0;
+    };
+    std::vector<int> ringIds;
+    for (const PoseFrameLayout &layout : layouts) {
+      ringIds.push_back(layout.ring);
+    }
+    std::sort(ringIds.begin(), ringIds.end());
+    ringIds.erase(std::unique(ringIds.begin(), ringIds.end()), ringIds.end());
+    std::vector<std::future<RingGraphCutResult>> pending;
+    for (int ringId : ringIds) {
+      std::vector<int> indices;
+      std::vector<cv::UMat> ringImages;
+      std::vector<cv::Point> ringCorners;
+      std::vector<cv::UMat> ringMasks;
+      for (int index = 0; index < frameCount; ++index) {
+        if (layouts[static_cast<std::size_t>(index)].ring != ringId) {
+          continue;
+        }
+        indices.push_back(index);
+        ringImages.push_back(floatingImages[static_cast<std::size_t>(index)]);
+        ringCorners.push_back(corners[static_cast<std::size_t>(index)]);
+        ringMasks.push_back(seamMasksU[static_cast<std::size_t>(index)]);
+      }
+      if (indices.size() < 2) {
+        continue;
+      }
+      pending.push_back(std::async(
+          std::launch::async,
+          [ringId, indices = std::move(indices),
+           ringImages = std::move(ringImages),
+           ringCorners = std::move(ringCorners),
+           ringMasks = std::move(ringMasks)]() mutable {
+            const int64 ringStarted = cv::getTickCount();
+            cv::detail::GraphCutSeamFinder seamFinder(
+                cv::detail::GraphCutSeamFinderBase::COST_COLOR);
+            seamFinder.find(ringImages, ringCorners, ringMasks);
+            RingGraphCutResult result;
+            result.ringId = ringId;
+            result.indices = std::move(indices);
+            result.masks = std::move(ringMasks);
+            result.elapsedSeconds =
+                (cv::getTickCount() - ringStarted) / cv::getTickFrequency();
+            return result;
+          }));
+    }
+    for (auto &future : pending) {
+      RingGraphCutResult result = future.get();
+      graphCutRingSeconds.emplace_back(result.ringId, result.elapsedSeconds);
+      for (std::size_t local = 0; local < result.indices.size(); ++local) {
+        result.masks[local].copyTo(seamMasksU[static_cast<std::size_t>(
+            result.indices[local])]);
+      }
+    }
   } catch (const cv::Exception &) {
     seamStatus = "adaptive-ring-seam-fallback-after-open-cv-error";
     for (int index = 0; index < frameCount; ++index) {
       warpedMasks[static_cast<std::size_t>(index)].copyTo(
           seamMasksU[static_cast<std::size_t>(index)]);
     }
+  } catch (const std::exception &) {
+    seamStatus = "adaptive-ring-seam-fallback-after-concurrency-error";
+    for (int index = 0; index < frameCount; ++index) {
+      warpedMasks[static_cast<std::size_t>(index)].copyTo(
+          seamMasksU[static_cast<std::size_t>(index)]);
+    }
   }
+  std::sort(graphCutRingSeconds.begin(), graphCutRingSeconds.end());
+  const double graphCutSeconds =
+      (cv::getTickCount() - graphCutStarted) / cv::getTickFrequency();
 
   for (int index = 0; index < frameCount; ++index) {
     warpedMasks[static_cast<std::size_t>(index)] =
         seamMasksU[static_cast<std::size_t>(index)].getMat(cv::ACCESS_READ).clone();
   }
+  const double seamStageSeconds =
+      (cv::getTickCount() - seamStageStarted) / cv::getTickFrequency();
 
+  const int64 blendStageStarted = cv::getTickCount();
   reportProgress(request, 0.75, "Blending");
   const double composeWorkAspect = composeScale / workScale;
   const float composeWarperScale =
@@ -691,12 +794,71 @@ StitchArtifacts PanoramaEngine::stitch(const StitchRequest &request) {
             equirectangularMask(cv::Rect(0, dstY, panoramaMask.cols, copyHeight)));
   }
   makeLongitudeBoundaryContinuous(equirectangular, equirectangularMask);
+  const double blendStageSeconds =
+      (cv::getTickCount() - blendStageStarted) / cv::getTickFrequency();
 
-  reportProgress(request, 0.92, "Direct sphere fill");
-  cv::Mat directFillLabels;
+  reportProgress(request, 0.90, "Projection-native poles");
+  cv::Mat directFillLabels(equirectangular.size(), CV_16S, cv::Scalar(-1));
+  PolarCubeFaceStats polarCubeStats;
+  std::string polarCubeStatus = "enabled";
+  try {
+    polarCubeStats = composeTopCubeFace(
+        equirectangular, equirectangularMask, &directFillLabels,
+        composeScaleImages, cameras, layouts, workScale, composeScale,
+        kPolarCubeSeamSize, kPolarCubeComposeSize,
+        kPolarCubeFieldOfViewDegrees, kStructureBlendBands,
+        kPolarCubeFullLatitudeDegrees, kPolarCubeMinimumLatitudeDegrees);
+    if (!polarCubeStats.enabled) {
+      polarCubeStatus = "skipped-insufficient-new-coverage";
+    }
+  } catch (const cv::Exception &) {
+    polarCubeStatus = "fallback-after-open-cv-error";
+  } catch (const std::exception &) {
+    polarCubeStatus = "fallback-after-compositor-error";
+  }
+  for (std::size_t index = 0; index < contributionPixels.size(); ++index) {
+    if (index < polarCubeStats.selectedPixelsByInput.size()) {
+      contributionPixels[index] +=
+          polarCubeStats.selectedPixelsByInput[index];
+    }
+  }
+  PolarCubeFaceStats bottomCubeStats;
+  std::string bottomCubeStatus = "enabled";
+  try {
+    bottomCubeStats = composeBottomCubeFace(
+        equirectangular, equirectangularMask, &directFillLabels,
+        composeScaleImages, cameras, layouts, workScale, composeScale,
+        kPolarCubeSeamSize, kPolarCubeComposeSize,
+        kPolarCubeFieldOfViewDegrees, kStructureBlendBands,
+        kPolarCubeFullLatitudeDegrees, kPolarCubeMinimumLatitudeDegrees);
+    if (!bottomCubeStats.enabled) {
+      if (bottomCubeStats.centralPairGateRejected) {
+        bottomCubeStatus = "skipped-central-pair-gate";
+      } else if (bottomCubeStats.responseFieldGateRejected) {
+        bottomCubeStatus = "skipped-response-field-gate";
+      } else {
+        bottomCubeStatus = "skipped-insufficient-new-coverage";
+      }
+    }
+  } catch (const cv::Exception &) {
+    bottomCubeStatus = "fallback-after-open-cv-error";
+  } catch (const std::exception &) {
+    bottomCubeStatus = "fallback-after-compositor-error";
+  }
+  for (std::size_t index = 0; index < contributionPixels.size(); ++index) {
+    if (index < bottomCubeStats.selectedPixelsByInput.size()) {
+      contributionPixels[index] +=
+          bottomCubeStats.selectedPixelsByInput[index];
+    }
+  }
+
+  reportProgress(request, 0.94, "Residual sphere fill");
+  const int64 directFillStarted = cv::getTickCount();
   DirectSphereFillStats directSphereFill = fillEquirectangularHoles(
       equirectangular, equirectangularMask, &directFillLabels, composeScaleImages,
       cameras, workScale, composeScale);
+  const double directFillElapsedSeconds =
+      (cv::getTickCount() - directFillStarted) / cv::getTickFrequency();
   for (std::size_t index = 0; index < contributionPixels.size(); ++index) {
     if (index < directSphereFill.filledPixelsByInput.size()) {
       contributionPixels[index] +=
@@ -705,6 +867,7 @@ StitchArtifacts PanoramaEngine::stitch(const StitchRequest &request) {
   }
   makeLongitudeBoundaryContinuous(equirectangular, equirectangularMask);
 
+  const int64 imageWriteStarted = cv::getTickCount();
   const std::filesystem::path panoramaPath =
       request.outputDirectory / "panorama_equirectangular.jpg";
   if (!cv::imwrite(panoramaPath.string(), equirectangular,
@@ -712,10 +875,27 @@ StitchArtifacts PanoramaEngine::stitch(const StitchRequest &request) {
     throw std::runtime_error("Could not write the equirectangular panorama");
   }
 
-  cv::Mat contributionColor(contributionMap.size(), CV_8UC3, cv::Scalar::all(0));
-  for (int row = 0; row < contributionMap.rows; ++row) {
-    for (int column = 0; column < contributionMap.cols; ++column) {
-      const short label = contributionMap.at<short>(row, column);
+  cv::Mat fullContributionMap(sphereHeight, sphereWidth, CV_16S,
+                              cv::Scalar(-1));
+  if (copyHeight > 0) {
+    contributionMap(cv::Rect(0, 0, contributionMap.cols, copyHeight))
+        .copyTo(fullContributionMap(
+            cv::Rect(0, dstY, contributionMap.cols, copyHeight)));
+  }
+  for (int row = 0; row < directFillLabels.rows; ++row) {
+    const short *fillRow = directFillLabels.ptr<short>(row);
+    short *fullRow = fullContributionMap.ptr<short>(row);
+    for (int column = 0; column < directFillLabels.cols; ++column) {
+      if (fillRow[column] >= 0) {
+        fullRow[column] = fillRow[column];
+      }
+    }
+  }
+  cv::Mat contributionColor(fullContributionMap.size(), CV_8UC3,
+                            cv::Scalar::all(0));
+  for (int row = 0; row < fullContributionMap.rows; ++row) {
+    for (int column = 0; column < fullContributionMap.cols; ++column) {
+      const short label = fullContributionMap.at<short>(row, column);
       if (label < 0) {
         continue;
       }
@@ -728,6 +908,8 @@ StitchArtifacts PanoramaEngine::stitch(const StitchRequest &request) {
   const std::filesystem::path contributionPath =
       request.outputDirectory / "contribution_map.png";
   cv::imwrite(contributionPath.string(), contributionColor);
+  const double imageWriteSeconds =
+      (cv::getTickCount() - imageWriteStarted) / cv::getTickFrequency();
 
   const double elapsedSeconds =
       (cv::getTickCount() - started) / cv::getTickFrequency();
@@ -746,6 +928,23 @@ StitchArtifacts PanoramaEngine::stitch(const StitchRequest &request) {
   json << "  \"opencv_version\": \"" << CV_VERSION << "\",\n";
   json << "  \"status\": \"success\",\n";
   json << "  \"elapsed_seconds\": " << elapsedSeconds << ",\n";
+  json << "  \"stage_timings_seconds\": {\n";
+  json << "    \"manifest_and_pose_graph\": " << manifestAndPoseGraphSeconds
+       << ",\n";
+  json << "    \"sift_matching\": " << siftSeconds << ",\n";
+  json << "    \"sensor_anchored_refinement\": " << refinementSeconds
+       << ",\n";
+  json << "    \"adaptive_ring_seam\": " << seamStageSeconds << ",\n";
+  json << "    \"spherical_composition_and_blend\": " << blendStageSeconds
+       << ",\n";
+  json << "    \"projection_native_zenith\": "
+       << polarCubeStats.elapsedSeconds << ",\n";
+  json << "    \"projection_native_nadir\": "
+       << bottomCubeStats.elapsedSeconds << ",\n";
+  json << "    \"residual_sphere_fill\": " << directFillElapsedSeconds
+       << ",\n";
+  json << "    \"image_write\": " << imageWriteSeconds << "\n";
+  json << "  },\n";
   json << "  \"configuration\": {\n";
   json << "    \"work_megapix\": " << kWorkMegapixels << ",\n";
   json << "    \"seam_megapix\": " << kSeamMegapixels << ",\n";
@@ -759,6 +958,15 @@ StitchArtifacts PanoramaEngine::stitch(const StitchRequest &request) {
   json << "    \"blend_bands\": " << kStructureBlendBands << ",\n";
   json << "    \"ring_seam_overlap_fraction\": " << kRingSeamOverlapFraction
        << ",\n";
+  json << "    \"polar_cube_seam_size\": " << kPolarCubeSeamSize << ",\n";
+  json << "    \"polar_cube_compose_size\": " << kPolarCubeComposeSize
+       << ",\n";
+  json << "    \"polar_cube_field_of_view_degrees\": "
+       << kPolarCubeFieldOfViewDegrees << ",\n";
+  json << "    \"polar_cube_full_latitude_degrees\": "
+       << kPolarCubeFullLatitudeDegrees << ",\n";
+  json << "    \"polar_cube_minimum_latitude_degrees\": "
+       << kPolarCubeMinimumLatitudeDegrees << ",\n";
   json << "    \"approved_pose_overlap_pairs\": " << approvedPairCount << "\n";
   json << "  },\n";
   json << "  \"pose_overlap\": {\n";
@@ -801,6 +1009,19 @@ StitchArtifacts PanoramaEngine::stitch(const StitchRequest &request) {
   json << "]\n  },\n";
   json << "  \"adaptive_ring_seam\": {\n";
   json << "    \"mode\": \"" << jsonEscape(seamReport.mode) << "\",\n";
+  json << "    \"warp_seconds\": " << seamWarpSeconds << ",\n";
+  json << "    \"ring_prior_seconds\": " << ringPriorSeconds << ",\n";
+  json << "    \"exposure_seconds\": " << exposureSeconds << ",\n";
+  json << "    \"graphcut_seconds\": " << graphCutSeconds << ",\n";
+  json << "    \"graphcut_ring_seconds\": [";
+  for (std::size_t index = 0; index < graphCutRingSeconds.size(); ++index) {
+    if (index > 0) {
+      json << ", ";
+    }
+    json << "{\"ring\": " << graphCutRingSeconds[index].first
+         << ", \"seconds\": " << graphCutRingSeconds[index].second << "}";
+  }
+  json << "],\n";
   json << "    \"coverage_pixels_restored\": "
        << seamReport.coveragePixelsRestored << ",\n";
   json << "    \"boundary_count\": " << seamReport.boundaries.size() << ",\n";
@@ -823,12 +1044,106 @@ StitchArtifacts PanoramaEngine::stitch(const StitchRequest &request) {
   }
   json << "\n    ]\n";
   json << "  },\n";
+  const auto writePolarCubeFace =
+      [&](const std::string &key, const std::string &status,
+          const PolarCubeFaceStats &stats) {
+        json << "  \"" << key << "\": {\n";
+        json << "    \"status\": \"" << jsonEscape(status) << "\",\n";
+        json << "    \"enabled\": " << (stats.enabled ? "true" : "false")
+             << ",\n";
+        json << "    \"pole\": \"" << jsonEscape(stats.pole) << "\",\n";
+        json << "    \"source_count\": " << stats.sourceCount << ",\n";
+        json << "    \"feed_count\": " << stats.feedCount << ",\n";
+        json << "    \"replaced_pixels\": " << stats.replacedPixels << ",\n";
+        json << "    \"newly_covered_pixels\": " << stats.newlyCoveredPixels
+             << ",\n";
+        json << "    \"graphcut_seconds\": " << stats.graphCutSeconds
+             << ",\n";
+        json << "    \"topology_pruned_components\": "
+             << stats.topologyPrunedComponents << ",\n";
+        json << "    \"topology_reassigned_pixels\": "
+             << stats.topologyReassignedPixels << ",\n";
+        json << "    \"central_pair\": {\n";
+        json << "      \"selected\": "
+             << (stats.centralPairSelected ? "true" : "false") << ",\n";
+        json << "      \"gate_rejected\": "
+             << (stats.centralPairGateRejected ? "true" : "false") << ",\n";
+        json << "      \"coverage\": " << stats.centralPairCoverage << ",\n";
+        json << "      \"score\": " << stats.centralPairScore << ",\n";
+        json << "      \"elapsed_seconds\": " << stats.centralPairSeconds
+             << ",\n";
+        json << "      \"input_indices\": [";
+        for (std::size_t index = 0;
+             index < stats.centralPairInputIndices.size(); ++index) {
+          if (index > 0) {
+            json << ", ";
+          }
+          json << stats.centralPairInputIndices[index];
+        }
+        json << "]\n";
+        json << "    },\n";
+        json << "    \"elapsed_seconds\": " << stats.elapsedSeconds << ",\n";
+        json << "    \"response_field\": {\n";
+        json << "      \"accepted\": "
+             << (stats.responseFieldAccepted ? "true" : "false") << ",\n";
+        json << "      \"gate_rejected\": "
+             << (stats.responseFieldGateRejected ? "true" : "false")
+             << ",\n";
+        json << "      \"equation_count\": " << stats.responseFieldEquationCount
+             << ",\n";
+        json << "      \"pair_count\": " << stats.responseFieldPairCount
+             << ",\n";
+        json << "      \"elapsed_seconds\": " << stats.responseFieldSeconds
+             << ",\n";
+        json << "      \"median_absolute_log_difference_before\": "
+             << stats.responseFieldMedianBefore << ",\n";
+        json << "      \"median_absolute_log_difference_after\": "
+             << stats.responseFieldMedianAfter << ",\n";
+        json << "      \"p90_absolute_log_difference_before\": "
+             << stats.responseFieldP90Before << ",\n";
+        json << "      \"p90_absolute_log_difference_after\": "
+             << stats.responseFieldP90After << ",\n";
+        json << "      \"gain_ranges_by_input\": [";
+        for (std::size_t index = 0;
+             index < stats.responseFieldGainRangesByInput.size(); ++index) {
+          if (index > 0) {
+            json << ", ";
+          }
+          json << "[" << stats.responseFieldGainRangesByInput[index][0] << ", "
+               << stats.responseFieldGainRangesByInput[index][1] << "]";
+        }
+        json << "]\n";
+        json << "    },\n";
+        json << "    \"photometric_gains_bgr\": ["
+             << stats.photometricGainsBGR[0] << ", "
+             << stats.photometricGainsBGR[1] << ", "
+             << stats.photometricGainsBGR[2] << "],\n";
+        json << "    \"longitude_gain_accepted\": "
+             << (stats.longitudeGainAccepted ? "true" : "false") << ",\n";
+        json << "    \"longitude_gain_rejected_by_cap_pressure\": "
+             << (stats.longitudeGainRejectedByCapPressure ? "true" : "false")
+             << ",\n";
+        json << "    \"longitude_gain_supported_columns\": "
+             << stats.longitudeGainSupportedColumns << ",\n";
+        json << "    \"longitude_gain_minimum\": "
+             << stats.longitudeGainMinimum << ",\n";
+        json << "    \"longitude_gain_maximum\": "
+             << stats.longitudeGainMaximum << ",\n";
+        json << "    \"longitude_gain_p05\": " << stats.longitudeGainP05
+             << ",\n";
+        json << "    \"longitude_gain_p95\": " << stats.longitudeGainP95
+             << "\n";
+        json << "  },\n";
+      };
+  writePolarCubeFace("polar_cube_face", polarCubeStatus, polarCubeStats);
+  writePolarCubeFace("bottom_cube_face", bottomCubeStatus, bottomCubeStats);
   json << "  \"direct_sphere_fill\": {\n";
   json << "    \"enabled\": " << (directSphereFill.enabled ? "true" : "false")
        << ",\n";
   json << "    \"filled_pixels\": " << directSphereFill.filledPixels << ",\n";
   json << "    \"remaining_pixels\": " << directSphereFill.remainingPixels
        << ",\n";
+  json << "    \"elapsed_seconds\": " << directFillElapsedSeconds << ",\n";
   json << "    \"filled_pixels_by_input\": [";
   for (std::size_t index = 0; index < directSphereFill.filledPixelsByInput.size();
        ++index) {
@@ -869,6 +1184,8 @@ StitchArtifacts PanoramaEngine::stitch(const StitchRequest &request) {
       json << ",\n";
     }
     const PreparedFrame &frame = frames[index];
+    cv::Mat finalRotation;
+    cameras[index].R.convertTo(finalRotation, CV_64F);
     json << "    {\n";
     json << "      \"index\": " << index << ",\n";
     json << "      \"file\": \"" << jsonEscape(frame.input.imageFilename)
@@ -880,6 +1197,20 @@ StitchArtifacts PanoramaEngine::stitch(const StitchRequest &request) {
     json << "      \"feature_count\": " << frame.featureCount << ",\n";
     json << "      \"focal\": " << cameras[index].focal << ",\n";
     json << "      \"aspect\": " << cameras[index].aspect << ",\n";
+    json << "      \"principal_point\": [" << cameras[index].ppx << ", "
+         << cameras[index].ppy << "],\n";
+    json << "      \"rotation_matrix\": [\n";
+    for (int row = 0; row < 3; ++row) {
+      json << "        [";
+      for (int column = 0; column < 3; ++column) {
+        if (column > 0) {
+          json << ", ";
+        }
+        json << finalRotation.at<double>(row, column);
+      }
+      json << "]" << (row < 2 ? "," : "") << "\n";
+    }
+    json << "      ],\n";
     json << "      \"correction_degrees\": "
          << (index < refineReport.solution.cameraCorrectionDegrees.size()
                  ? refineReport.solution.cameraCorrectionDegrees[index]

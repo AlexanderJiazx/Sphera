@@ -303,8 +303,8 @@ NSError *nativeError(NSString *description) {
         @try {
           NSDictionary *failureReport = @{
             @"engine" : @"sphera-ios-native",
-            @"pipeline_version" : @"sensor_first_s1_adaptive_ring_seam_v1",
-            @"recipe" : @"sensor_first_s1_adaptive_ring_seam",
+            @"pipeline_version" : @"sensor_first_s1_adaptive_ring_seam_polar_cube_v2",
+            @"recipe" : @"sensor_first_s1_adaptive_ring_seam_polar_cube",
             @"ml_model_usage" : @"none",
             @"status" : @"error",
             @"error" : description,

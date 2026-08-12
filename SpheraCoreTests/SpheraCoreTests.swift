@@ -910,9 +910,11 @@ func sensorFirstEngineInitializationStages() async throws {
         "sift-matching",
         "sensor-anchored-refinement",
         "adaptive-periodic-ring-seam",
-        "structure-aware-graph-cut",
         "exposure-gain-blocks",
+        "concurrent-ring-local-structure-graph-cut",
         "five-band-blend",
+        "projection-native-top-cube-face",
+        "residual-direct-sphere-fill",
       ]
   )
   await store.abandon()
@@ -922,13 +924,15 @@ func sensorFirstEngineInitializationStages() async throws {
 enum SpheraEngineProductDefaults {
   static let loadsMLModelsOnDefaultPath = false
   static let maximumPoseRefinementDegrees = 6.0
-  static let recipe = "sensor_first_s1_adaptive_ring_seam"
+  static let recipe = "sensor_first_s1_adaptive_ring_seam_polar_cube"
 }
 
 @Test("Default stitch product path loads zero ML models")
 func defaultStitchPathLoadsNoMLModels() {
   #expect(!SpheraEngineProductDefaults.loadsMLModelsOnDefaultPath)
   #expect(SpheraEngineProductDefaults.maximumPoseRefinementDegrees == 6)
-  #expect(SpheraEngineProductDefaults.recipe == "sensor_first_s1_adaptive_ring_seam")
+  #expect(
+    SpheraEngineProductDefaults.recipe
+      == "sensor_first_s1_adaptive_ring_seam_polar_cube"
+  )
 }
-

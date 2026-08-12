@@ -1,4 +1,5 @@
 #include "SpheraAdaptiveRingSeam.hpp"
+#include "SpheraDirectSphere.hpp"
 #include "SpheraEngineMath.hpp"
 #include "SpheraPanoramaEngine.hpp"
 #include "SpheraPoseOverlap.hpp"
@@ -15,6 +16,7 @@
 #pragma clang diagnostic ignored "-Wdocumentation"
 #include <opencv2/calib3d.hpp>
 #include <opencv2/core.hpp>
+#include <opencv2/imgproc.hpp>
 #pragma clang diagnostic pop
 
 namespace {
@@ -267,6 +269,100 @@ void testGateHelpers() {
              "relative gate");
 }
 
+void testPolarCubeCoverage() {
+  cv::Mat panorama(256, 512, CV_8UC3, cv::Scalar(60, 70, 80));
+  cv::Mat mask(256, 512, CV_8U, cv::Scalar(255));
+  mask.rowRange(0, 20).setTo(0);
+  panorama.rowRange(0, 20).setTo(cv::Scalar::all(0));
+  cv::Mat labels(256, 512, CV_16S, cv::Scalar(-1));
+
+  std::vector<cv::Mat> images(2);
+  for (int index = 0; index < 2; ++index) {
+    images[index] = cv::Mat(128, 128, CV_8UC3,
+                            cv::Scalar(100 + 10 * index, 130, 170));
+    cv::circle(images[index], cv::Point(64, 64), 18,
+               cv::Scalar(180, 200, 220), -1, cv::LINE_AA);
+  }
+  std::vector<cv::detail::CameraParams> cameras(2);
+  const cv::Mat topCameraToWorld =
+      (cv::Mat_<float>(3, 3) << 1, 0, 0, 0, 0, -1, 0, 1, 0);
+  for (auto &camera : cameras) {
+    camera.focal = 70;
+    camera.aspect = 1;
+    camera.ppx = 64;
+    camera.ppy = 64;
+    camera.R = topCameraToWorld.clone();
+    camera.t = cv::Mat::zeros(3, 1, CV_32F);
+  }
+  std::vector<sphera::PoseFrameLayout> layouts(2);
+  for (int index = 0; index < 2; ++index) {
+    layouts[index].ring = 2;
+    layouts[index].ringName = "upward";
+    layouts[index].localIndex = index;
+    layouts[index].ringSize = 2;
+  }
+  const cv::Mat untouchedBoundaryRow = panorama.row(30).clone();
+  const auto stats = sphera::composeTopCubeFace(
+      panorama, mask, &labels, images, cameras, layouts, 1.0, 1.0, 64, 128);
+  expect(stats.enabled, "polar cube enabled with upward coverage");
+  expect(stats.newlyCoveredPixels > 0, "polar cube adds pole coverage");
+  expect(mask.at<uchar>(0, 256) != 0, "polar cube covers zenith sample");
+  expect(labels.at<short>(0, 256) >= 0, "polar cube records source owner");
+  expect(stats.responseFieldEquationCount > 0,
+         "polar cube builds same-ray response equations");
+  expect(stats.responseFieldAccepted,
+         "polar cube accepts a strongly supported response field");
+  expect(cv::norm(panorama.row(30), untouchedBoundaryRow, cv::NORM_INF) == 0,
+         "polar cube alpha does not leak below its latitude boundary");
+}
+
+void testBottomCubeCoverageAndGate() {
+  cv::Mat panorama(256, 512, CV_8UC3, cv::Scalar(60, 70, 80));
+  cv::Mat mask(256, 512, CV_8U, cv::Scalar(255));
+  mask.rowRange(236, 256).setTo(0);
+  panorama.rowRange(236, 256).setTo(cv::Scalar::all(0));
+  cv::Mat labels(256, 512, CV_16S, cv::Scalar(-1));
+
+  std::vector<cv::Mat> images(2);
+  for (int index = 0; index < 2; ++index) {
+    images[index] = cv::Mat(128, 128, CV_8UC3,
+                            cv::Scalar(100 + 10 * index, 130, 170));
+    cv::circle(images[index], cv::Point(64, 64), 18,
+               cv::Scalar(180, 200, 220), -1, cv::LINE_AA);
+  }
+  std::vector<cv::detail::CameraParams> cameras(2);
+  const cv::Mat bottomCameraToWorld =
+      (cv::Mat_<float>(3, 3) << 1, 0, 0, 0, 0, 1, 0, -1, 0);
+  for (auto &camera : cameras) {
+    camera.focal = 70;
+    camera.aspect = 1;
+    camera.ppx = 64;
+    camera.ppy = 64;
+    camera.R = bottomCameraToWorld.clone();
+    camera.t = cv::Mat::zeros(3, 1, CV_32F);
+  }
+  std::vector<sphera::PoseFrameLayout> layouts(2);
+  for (int index = 0; index < 2; ++index) {
+    layouts[index].ring = 1;
+    layouts[index].ringName = "downward";
+    layouts[index].localIndex = index;
+    layouts[index].ringSize = 2;
+  }
+  const cv::Mat untouchedBoundaryRow = panorama.row(225).clone();
+  const auto stats = sphera::composeBottomCubeFace(
+      panorama, mask, &labels, images, cameras, layouts, 1.0, 1.0, 64, 128);
+  expect(stats.enabled, "bottom cube enabled with reliable downward coverage");
+  expect(stats.centralPairSelected,
+         "bottom cube selects a connected central source pair");
+  expect(stats.responseFieldAccepted,
+         "bottom cube requires a supported same-ray response field");
+  expect(mask.at<uchar>(255, 256) != 0, "bottom cube covers nadir sample");
+  expect(labels.at<short>(255, 256) >= 0,
+         "bottom cube records nadir source owner");
+  expect(cv::norm(panorama.row(225), untouchedBoundaryRow, cv::NORM_INF) == 0,
+         "bottom cube alpha does not leak above its latitude boundary");
+}
+
 } // namespace
 
 int main() {
@@ -279,6 +375,8 @@ int main() {
     testPeriodicSeamClosure();
     testCoverageRestoration();
     testGateHelpers();
+    testPolarCubeCoverage();
+    testBottomCubeCoverageAndGate();
   } catch (const std::exception &exception) {
     std::cerr << "EXCEPTION: " << exception.what() << "\n";
     return 1;
