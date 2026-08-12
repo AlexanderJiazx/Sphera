@@ -914,6 +914,7 @@ func sensorFirstEngineInitializationStages() async throws {
         "concurrent-ring-local-structure-graph-cut",
         "five-band-blend",
         "projection-native-top-cube-face",
+        "projection-native-bottom-cube-face",
         "residual-direct-sphere-fill",
       ]
   )

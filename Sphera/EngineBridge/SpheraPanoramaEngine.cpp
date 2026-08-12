@@ -31,8 +31,14 @@
 #include <future>
 #include <sstream>
 #include <stdexcept>
+#include <sys/resource.h>
 #include <unordered_map>
 #include <vector>
+
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach/task_info.h>
+#endif
 
 namespace sphera {
 namespace {
@@ -58,6 +64,28 @@ constexpr double kPolarCubeFieldOfViewDegrees = 100.0;
 constexpr double kPolarCubeFullLatitudeDegrees = 78.0;
 constexpr double kPolarCubeMinimumLatitudeDegrees = 69.0;
 constexpr double kPi = 3.14159265358979323846;
+
+double currentPhysFootprintMegabytes() {
+#if defined(__APPLE__)
+  task_vm_info_data_t info;
+  mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+  if (task_info(mach_task_self(), TASK_VM_INFO,
+                reinterpret_cast<task_info_t>(&info), &count) != KERN_SUCCESS) {
+    return 0.0;
+  }
+  return static_cast<double>(info.phys_footprint) / (1024.0 * 1024.0);
+#else
+  return 0.0;
+#endif
+}
+
+double peakRssMegabytes() {
+  rusage usage{};
+  if (getrusage(RUSAGE_SELF, &usage) != 0) {
+    return 0.0;
+  }
+  return static_cast<double>(usage.ru_maxrss) / (1024.0 * 1024.0);
+}
 
 using cv::detail::CameraParams;
 using cv::detail::ImageFeatures;
@@ -928,6 +956,15 @@ StitchArtifacts PanoramaEngine::stitch(const StitchRequest &request) {
   json << "  \"opencv_version\": \"" << CV_VERSION << "\",\n";
   json << "  \"status\": \"success\",\n";
   json << "  \"elapsed_seconds\": " << elapsedSeconds << ",\n";
+  json << "  \"peak_memory_megabytes\": {\n";
+  json << "    \"rss\": " << peakRssMegabytes() << ",\n";
+  json << "    \"phys_footprint\": " << currentPhysFootprintMegabytes()
+       << ",\n";
+  json << "    \"response_field_phys_footprint\": "
+       << std::max(polarCubeStats.responseFieldPeakMegabytes,
+                   bottomCubeStats.responseFieldPeakMegabytes)
+       << "\n";
+  json << "  },\n";
   json << "  \"stage_timings_seconds\": {\n";
   json << "    \"manifest_and_pose_graph\": " << manifestAndPoseGraphSeconds
        << ",\n";
@@ -1103,6 +1140,8 @@ StitchArtifacts PanoramaEngine::stitch(const StitchRequest &request) {
              << stats.responseFieldP90Before << ",\n";
         json << "      \"p90_absolute_log_difference_after\": "
              << stats.responseFieldP90After << ",\n";
+        json << "      \"peak_phys_footprint_megabytes\": "
+             << stats.responseFieldPeakMegabytes << ",\n";
         json << "      \"gain_ranges_by_input\": [";
         for (std::size_t index = 0;
              index < stats.responseFieldGainRangesByInput.size(); ++index) {

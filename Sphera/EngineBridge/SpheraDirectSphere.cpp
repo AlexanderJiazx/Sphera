@@ -4,9 +4,15 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <limits>
 #include <stdexcept>
 #include <vector>
+
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach/task_info.h>
+#endif
 
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdocumentation"
@@ -87,8 +93,27 @@ struct PairwiseResponseFieldEstimate {
   double medianAfter = 0.0;
   double p90Before = 0.0;
   double p90After = 0.0;
+  double peakMegabytes = 0.0;
   std::vector<cv::Vec2d> gainRanges;
 };
+
+double currentPhysFootprintMegabytes() {
+#if defined(__APPLE__)
+  task_vm_info_data_t info;
+  mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+  if (task_info(mach_task_self(), TASK_VM_INFO,
+                reinterpret_cast<task_info_t>(&info), &count) != KERN_SUCCESS) {
+    return 0.0;
+  }
+  return static_cast<double>(info.phys_footprint) / (1024.0 * 1024.0);
+#else
+  return 0.0;
+#endif
+}
+
+void considerPeakMegabytes(double &peakMegabytes) {
+  peakMegabytes = std::max(peakMegabytes, currentPhysFootprintMegabytes());
+}
 
 struct ResponsePairPlan {
   int first = 0;
@@ -97,6 +122,98 @@ struct ResponsePairPlan {
   int sampleStep = 1;
   int sampleCount = 0;
 };
+
+// Compact same-ray observation. A dense n×p CV_64F design matrix plus a
+// weighted clone peaked around 160 MB on DC71722A (247k×42). This keeps the
+// identical 7-parameter IRLS, just without materializing A.
+struct ResponseSample {
+  std::uint16_t first = 0;
+  std::uint16_t second = 0;
+  float firstX = 0;
+  float firstY = 0;
+  float firstTone = 0;
+  float secondX = 0;
+  float secondY = 0;
+  float secondTone = 0;
+  double observed = 0;
+  double baseWeight = 0;
+};
+
+constexpr int kResponseBasisCount = 7;
+
+void fillResponseBasis(double *basis, double x, double y, double tone) {
+  basis[0] = 1.0;
+  basis[1] = x;
+  basis[2] = y;
+  basis[3] = x * x;
+  basis[4] = x * y;
+  basis[5] = y * y;
+  basis[6] = tone;
+}
+
+double predictedLogDifference(const ResponseSample &sample,
+                              const double *coefficients) {
+  double firstBasis[kResponseBasisCount];
+  double secondBasis[kResponseBasisCount];
+  fillResponseBasis(firstBasis, sample.firstX, sample.firstY, sample.firstTone);
+  fillResponseBasis(secondBasis, sample.secondX, sample.secondY,
+                    sample.secondTone);
+  const double *first =
+      coefficients + static_cast<int>(sample.first) * kResponseBasisCount;
+  const double *second =
+      coefficients + static_cast<int>(sample.second) * kResponseBasisCount;
+  double firstField = 0.0;
+  double secondField = 0.0;
+  for (int basis = 0; basis < kResponseBasisCount; ++basis) {
+    firstField += first[basis] * firstBasis[basis];
+    secondField += second[basis] * secondBasis[basis];
+  }
+  return firstField - secondField;
+}
+
+void accumulateWeightedNormalEquations(
+    const std::vector<ResponseSample> &samples,
+    const std::vector<double> &robustWeights, int imageCount, cv::Mat &normal,
+    cv::Mat &rhs, double &weightSum) {
+  const int parameterCount = imageCount * kResponseBasisCount;
+  normal = cv::Mat::zeros(parameterCount, parameterCount, CV_64F);
+  rhs = cv::Mat::zeros(parameterCount, 1, CV_64F);
+  weightSum = 0.0;
+  double row[2 * kResponseBasisCount];
+  int indices[2 * kResponseBasisCount];
+  for (std::size_t sampleIndex = 0; sampleIndex < samples.size();
+       ++sampleIndex) {
+    const ResponseSample &sample = samples[sampleIndex];
+    const double weight = sample.baseWeight * robustWeights[sampleIndex];
+    const double squareRootWeight = std::sqrt(std::max(weight, 0.0));
+    weightSum += weight;
+    double firstBasis[kResponseBasisCount];
+    double secondBasis[kResponseBasisCount];
+    fillResponseBasis(firstBasis, sample.firstX, sample.firstY,
+                      sample.firstTone);
+    fillResponseBasis(secondBasis, sample.secondX, sample.secondY,
+                      sample.secondTone);
+    const int firstOffset =
+        static_cast<int>(sample.first) * kResponseBasisCount;
+    const int secondOffset =
+        static_cast<int>(sample.second) * kResponseBasisCount;
+    for (int basis = 0; basis < kResponseBasisCount; ++basis) {
+      indices[basis] = firstOffset + basis;
+      row[basis] = firstBasis[basis] * squareRootWeight;
+      indices[kResponseBasisCount + basis] = secondOffset + basis;
+      row[kResponseBasisCount + basis] =
+          -secondBasis[basis] * squareRootWeight;
+    }
+    const double weightedObserved = sample.observed * squareRootWeight;
+    for (int first = 0; first < 2 * kResponseBasisCount; ++first) {
+      rhs.at<double>(indices[first]) += row[first] * weightedObserved;
+      double *normalRow = normal.ptr<double>(indices[first]);
+      for (int second = 0; second < 2 * kResponseBasisCount; ++second) {
+        normalRow[indices[second]] += row[first] * row[second];
+      }
+    }
+  }
+}
 
 struct OwnerTopologyPruneStats {
   int removedComponents = 0;
@@ -472,6 +589,7 @@ PairwiseResponseFieldEstimate equalizePairwiseResponseFields(
   const int imageCount = static_cast<int>(images.size());
   estimate.gainRanges.assign(static_cast<std::size_t>(imageCount),
                              cv::Vec2d(1.0, 1.0));
+  considerPeakMegabytes(estimate.peakMegabytes);
   if (imageCount < 2 || masks.size() != images.size() ||
       normalizedSourceX.size() != images.size() ||
       normalizedSourceY.size() != images.size()) {
@@ -604,12 +722,9 @@ PairwiseResponseFieldEstimate equalizePairwiseResponseFields(
     return estimate;
   }
 
-  constexpr int kBasisCount = 7;
-  const int parameterCount = imageCount * kBasisCount;
-  cv::Mat design = cv::Mat::zeros(totalSamples, parameterCount, CV_64F);
-  cv::Mat observed(totalSamples, 1, CV_64F);
-  cv::Mat baseWeights(totalSamples, 1, CV_64F);
-  int sampleIndex = 0;
+  const int parameterCount = imageCount * kResponseBasisCount;
+  std::vector<ResponseSample> samples;
+  samples.reserve(static_cast<std::size_t>(totalSamples));
   for (const ResponsePairPlan &plan : plans) {
     int usableOrdinal = 0;
     for (int row = 0; row < images[0].rows; ++row) {
@@ -622,91 +737,67 @@ PairwiseResponseFieldEstimate equalizePairwiseResponseFields(
         if (!selected) {
           continue;
         }
-        double *designRow = design.ptr<double>(sampleIndex);
-        const int firstOffset = plan.first * kBasisCount;
-        const int secondOffset = plan.second * kBasisCount;
-        const float firstX = normalizedSourceX[static_cast<std::size_t>(plan.first)]
-                                 .at<float>(row, column);
-        const float firstY = normalizedSourceY[static_cast<std::size_t>(plan.first)]
-                                 .at<float>(row, column);
-        const float secondX = normalizedSourceX[static_cast<std::size_t>(plan.second)]
-                                  .at<float>(row, column);
-        const float secondY = normalizedSourceY[static_cast<std::size_t>(plan.second)]
-                                  .at<float>(row, column);
-        const double firstTone =
+        ResponseSample sample;
+        sample.first = static_cast<std::uint16_t>(plan.first);
+        sample.second = static_cast<std::uint16_t>(plan.second);
+        sample.firstX = normalizedSourceX[static_cast<std::size_t>(plan.first)]
+                            .at<float>(row, column);
+        sample.firstY = normalizedSourceY[static_cast<std::size_t>(plan.first)]
+                            .at<float>(row, column);
+        sample.secondX = normalizedSourceX[static_cast<std::size_t>(plan.second)]
+                             .at<float>(row, column);
+        sample.secondY = normalizedSourceY[static_cast<std::size_t>(plan.second)]
+                             .at<float>(row, column);
+        sample.firstTone = static_cast<float>(
             logs[static_cast<std::size_t>(plan.first)].at<float>(row, column) -
-            logCenters[static_cast<std::size_t>(plan.first)];
-        const double secondTone =
+            logCenters[static_cast<std::size_t>(plan.first)]);
+        sample.secondTone = static_cast<float>(
             logs[static_cast<std::size_t>(plan.second)].at<float>(row, column) -
-            logCenters[static_cast<std::size_t>(plan.second)];
-        const double firstBasis[kBasisCount] = {
-            1.0, firstX, firstY, firstX * firstX, firstX * firstY,
-            firstY * firstY, firstTone};
-        const double secondBasis[kBasisCount] = {
-            1.0, secondX, secondY, secondX * secondX, secondX * secondY,
-            secondY * secondY, secondTone};
-        for (int basis = 0; basis < kBasisCount; ++basis) {
-          designRow[firstOffset + basis] = firstBasis[basis];
-          designRow[secondOffset + basis] = -secondBasis[basis];
-        }
+            logCenters[static_cast<std::size_t>(plan.second)]);
         const float firstLog =
             logs[static_cast<std::size_t>(plan.first)].at<float>(row, column);
         const float secondLog =
             logs[static_cast<std::size_t>(plan.second)].at<float>(row, column);
-        observed.at<double>(sampleIndex) = secondLog - firstLog;
+        sample.observed = static_cast<double>(secondLog - firstLog);
         const float texture = std::max(
             textures[static_cast<std::size_t>(plan.first)].at<float>(row, column),
             textures[static_cast<std::size_t>(plan.second)].at<float>(row, column));
         const double normalizedTexture = texture / 8.0;
-        baseWeights.at<double>(sampleIndex) =
+        sample.baseWeight =
             1.0 / (1.0 + normalizedTexture * normalizedTexture);
-        ++sampleIndex;
+        samples.push_back(sample);
       }
     }
   }
-  if (sampleIndex != totalSamples) {
-    design = design.rowRange(0, sampleIndex).clone();
-    observed = observed.rowRange(0, sampleIndex).clone();
-    baseWeights = baseWeights.rowRange(0, sampleIndex).clone();
-    totalSamples = sampleIndex;
-  }
+  totalSamples = static_cast<int>(samples.size());
   estimate.equationCount = totalSamples;
   estimate.pairCount = static_cast<int>(plans.size());
+  considerPeakMegabytes(estimate.peakMegabytes);
 
-  cv::Mat robustWeights(totalSamples, 1, CV_64F, cv::Scalar(1.0));
+  std::vector<double> robustWeights(static_cast<std::size_t>(totalSamples), 1.0);
   cv::Mat coefficients(parameterCount, 1, CV_64F, cv::Scalar(0.0));
-  cv::Mat predicted;
-  const double regularizationByBasis[kBasisCount] = {
+  std::vector<double> predicted(static_cast<std::size_t>(totalSamples), 0.0);
+  const double regularizationByBasis[kResponseBasisCount] = {
       2e-6, 2e-4, 2e-4, 8e-4, 1.2e-3, 8e-4, 4e-4};
   bool solved = false;
+  bool hasPrediction = false;
   for (int iteration = 0; iteration < 8; ++iteration) {
-    cv::Mat weightedDesign = design.clone();
-    cv::Mat weightedObserved(totalSamples, 1, CV_64F);
-    double weightSum = 0.0;
-    for (int row = 0; row < totalSamples; ++row) {
-      const double weight = baseWeights.at<double>(row) *
-                            robustWeights.at<double>(row);
-      const double squareRootWeight = std::sqrt(std::max(weight, 0.0));
-      weightedDesign.row(row) *= squareRootWeight;
-      weightedObserved.at<double>(row) =
-          observed.at<double>(row) * squareRootWeight;
-      weightSum += weight;
-    }
-    weightSum = std::max(weightSum, 1.0);
     cv::Mat normal;
     cv::Mat rhs;
-    cv::gemm(weightedDesign, weightedDesign, 1.0, cv::noArray(), 0.0, normal,
-             cv::GEMM_1_T);
-    cv::gemm(weightedDesign, weightedObserved, 1.0, cv::noArray(), 0.0, rhs,
-             cv::GEMM_1_T);
+    double weightSum = 0.0;
+    accumulateWeightedNormalEquations(samples, robustWeights, imageCount,
+                                      normal, rhs, weightSum);
+    considerPeakMegabytes(estimate.peakMegabytes);
+    weightSum = std::max(weightSum, 1.0);
     for (int parameter = 0; parameter < parameterCount; ++parameter) {
       normal.at<double>(parameter, parameter) +=
-          regularizationByBasis[parameter % kBasisCount] * weightSum;
+          regularizationByBasis[parameter % kResponseBasisCount] * weightSum;
     }
     const double gaugeValue = 1.0 / imageCount;
     for (int first = 0; first < imageCount; ++first) {
       for (int second = 0; second < imageCount; ++second) {
-        normal.at<double>(first * kBasisCount, second * kBasisCount) +=
+        normal.at<double>(first * kResponseBasisCount,
+                          second * kResponseBasisCount) +=
             gaugeValue * gaugeValue * weightSum;
       }
     }
@@ -717,25 +808,32 @@ PairwiseResponseFieldEstimate equalizePairwiseResponseFields(
     if (!solved || !cv::checkRange(coefficients)) {
       break;
     }
-    cv::gemm(design, coefficients, 1.0, cv::noArray(), 0.0, predicted);
+    hasPrediction = true;
+    const double *coefficientData = coefficients.ptr<double>();
     std::vector<double> absoluteResiduals;
     absoluteResiduals.reserve(static_cast<std::size_t>(totalSamples));
     for (int row = 0; row < totalSamples; ++row) {
-      absoluteResiduals.push_back(
-          std::abs(observed.at<double>(row) - predicted.at<double>(row)));
+      predicted[static_cast<std::size_t>(row)] =
+          predictedLogDifference(samples[static_cast<std::size_t>(row)],
+                                 coefficientData);
+      absoluteResiduals.push_back(std::abs(
+          samples[static_cast<std::size_t>(row)].observed -
+          predicted[static_cast<std::size_t>(row)]));
     }
     const double scale =
         std::max(1.4826 * medianOfDoubles(std::move(absoluteResiduals)), 0.006);
     for (int row = 0; row < totalSamples; ++row) {
-      const double residual =
-          std::abs(observed.at<double>(row) - predicted.at<double>(row));
-      robustWeights.at<double>(row) =
+      const double residual = std::abs(
+          samples[static_cast<std::size_t>(row)].observed -
+          predicted[static_cast<std::size_t>(row)]);
+      robustWeights[static_cast<std::size_t>(row)] =
           std::min(1.0, 1.5 * scale / std::max(residual, 1e-8));
     }
   }
-  if (!solved || predicted.empty()) {
+  if (!solved || !hasPrediction) {
     estimate.elapsedSeconds =
         (cv::getTickCount() - started) / cv::getTickFrequency();
+    considerPeakMegabytes(estimate.peakMegabytes);
     return estimate;
   }
 
@@ -744,9 +842,11 @@ PairwiseResponseFieldEstimate equalizePairwiseResponseFields(
   absoluteBefore.reserve(static_cast<std::size_t>(totalSamples));
   absoluteAfter.reserve(static_cast<std::size_t>(totalSamples));
   for (int row = 0; row < totalSamples; ++row) {
-    absoluteBefore.push_back(std::abs(observed.at<double>(row)));
-    absoluteAfter.push_back(
-        std::abs(observed.at<double>(row) - predicted.at<double>(row)));
+    absoluteBefore.push_back(
+        std::abs(samples[static_cast<std::size_t>(row)].observed));
+    absoluteAfter.push_back(std::abs(
+        samples[static_cast<std::size_t>(row)].observed -
+        predicted[static_cast<std::size_t>(row)]));
   }
   estimate.medianBefore = percentileOfDoubles(absoluteBefore, 0.5);
   estimate.medianAfter = percentileOfDoubles(absoluteAfter, 0.5);
@@ -779,7 +879,7 @@ PairwiseResponseFieldEstimate equalizePairwiseResponseFields(
           const double y = yRow[column];
           const double tone =
               logRow[column] - logCenters[static_cast<std::size_t>(index)];
-          const int offset = index * kBasisCount;
+          const int offset = index * kResponseBasisCount;
           const double field = std::clamp(
               coefficients.at<double>(offset) +
                   coefficients.at<double>(offset + 1) * x +
@@ -805,6 +905,7 @@ PairwiseResponseFieldEstimate equalizePairwiseResponseFields(
   }
   estimate.elapsedSeconds =
       (cv::getTickCount() - started) / cv::getTickFrequency();
+  considerPeakMegabytes(estimate.peakMegabytes);
   return estimate;
 }
 
@@ -1179,6 +1280,13 @@ static PolarCubeFaceStats composePolarCubeFace(
           sourceIndices[static_cast<std::size_t>(centralPair.first)],
           sourceIndices[static_cast<std::size_t>(centralPair.second)]};
     }
+    if (!centralPair.accepted) {
+      stats.centralPairGateRejected = true;
+      stats.responseFieldGateRejected = requireResponseField;
+      stats.elapsedSeconds =
+          (cv::getTickCount() - started) / cv::getTickFrequency();
+      return stats;
+    }
   }
 
   std::vector<cv::Mat> composeImages;
@@ -1199,6 +1307,7 @@ static PolarCubeFaceStats composePolarCubeFace(
   stats.responseFieldMedianAfter = responseField.medianAfter;
   stats.responseFieldP90Before = responseField.p90Before;
   stats.responseFieldP90After = responseField.p90After;
+  stats.responseFieldPeakMegabytes = responseField.peakMegabytes;
   for (std::size_t localIndex = 0;
        localIndex < responseField.gainRanges.size(); ++localIndex) {
     stats.responseFieldGainRangesByInput[static_cast<std::size_t>(

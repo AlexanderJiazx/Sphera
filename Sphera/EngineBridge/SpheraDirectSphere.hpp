@@ -40,6 +40,7 @@ struct PolarCubeFaceStats {
   double responseFieldMedianAfter = 0;
   double responseFieldP90Before = 0;
   double responseFieldP90After = 0;
+  double responseFieldPeakMegabytes = 0;
   bool responseFieldGateRejected = false;
   std::vector<cv::Vec2d> responseFieldGainRangesByInput;
   cv::Vec3d photometricGainsBGR = cv::Vec3d(1, 1, 1);
