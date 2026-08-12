@@ -1,2 +1,13 @@
 .build/
 .swiftpm/
+
+# Desktop OpenCV source/build used by NativeTests. The iOS app links
+# Vendor/OpenCV/opencv2.framework instead.
+Vendor/OpenCVHost/
+
+# Local stitch/regression artifacts
+outputs/
+
+# NativeTests Makefile products
+NativeTests/test_sensor_first
+NativeTests/run_native_stitch
