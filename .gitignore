@@ -1,2 +1,5 @@
 .build/
 .swiftpm/
+NativeTests/build/
+NativeTests/test_sensor_first
+NativeTests/run_native_stitch
