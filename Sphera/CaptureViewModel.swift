@@ -50,6 +50,7 @@ final class CaptureViewModel: ObservableObject {
   private var lastNavigationTraceTimestamp = -Double.infinity
   private let navigationTraceEnabled =
     ProcessInfo.processInfo.arguments.contains("--navigation-trace")
+  private var isCaptureTabActive = false
 
   init(
     packageStore: CapturePackageStore = CapturePackageStore(),
@@ -112,7 +113,7 @@ final class CaptureViewModel: ObservableObject {
     Task {
       do {
         try motion.start()
-        try await camera.start()
+        try await startCameraIfCaptureTabActive(restoreAuto: true)
         _ = try await motion.waitForFirstSample()
         plan = CapturePlan(configuration: configuration)
         _ = try await packageStore.begin(
@@ -121,6 +122,7 @@ final class CaptureViewModel: ObservableObject {
         )
         phase = .awaitingPrimary
         statusMessage = "Frame the first shot, then capture"
+        stopCameraIfCaptureTabInactive()
       } catch {
         camera.stop()
         motion.stop()
@@ -145,7 +147,6 @@ final class CaptureViewModel: ObservableObject {
   /// can start a fresh session.
   func resetCapture() {
     guard phase == .capturingPoints else { return }
-    camera.stop()
     motion.stop()
     isCapturingPhoto = false
     stitchProgress = nil
@@ -159,6 +160,8 @@ final class CaptureViewModel: ObservableObject {
     capturedFrames = []
     statusMessage = "Resetting capture"
     Task {
+      await camera.unlockExposureFocusWhiteBalance()
+      camera.stop()
       await packageStore.abandon()
       phase = .setup
       statusMessage = "Ready"
@@ -321,9 +324,80 @@ final class CaptureViewModel: ObservableObject {
     galleryErrorMessage = nil
   }
 
+  /// Starts or stops the camera when the Capture tab becomes visible or hidden.
+  /// Motion keeps running so the capture-reference frame stays valid.
+  func setCaptureTabActive(_ active: Bool) {
+    let wasActive = isCaptureTabActive
+    isCaptureTabActive = active
+    guard wasActive != active else { return }
+
+    if active {
+      switch phase {
+      case .setup:
+        startCapture()
+      case .awaitingPrimary, .capturingPoints:
+        Task { await resumeCameraIfCaptureTabActive() }
+      default:
+        break
+      }
+    } else {
+      pauseCameraForHiddenCaptureTab()
+    }
+  }
+
+  private func startCameraIfCaptureTabActive(restoreAuto: Bool) async throws {
+    guard isCaptureTabActive else {
+      camera.stop()
+      return
+    }
+    try await camera.start(restoreAuto: restoreAuto)
+    guard isCaptureTabActive else {
+      camera.stop()
+      return
+    }
+    switch camera.state {
+    case .running, .configuring:
+      break
+    default:
+      try await camera.start(restoreAuto: restoreAuto)
+      if !isCaptureTabActive {
+        camera.stop()
+      }
+    }
+  }
+
+  private func resumeCameraIfCaptureTabActive() async {
+    guard isCaptureTabActive else { return }
+    do {
+      try await startCameraIfCaptureTabActive(restoreAuto: false)
+    } catch {
+      captureErrorMessage = error.localizedDescription
+    }
+  }
+
+  private func stopCameraIfCaptureTabInactive() {
+    if !isCaptureTabActive {
+      camera.stop()
+    }
+  }
+
+  private func pauseCameraForHiddenCaptureTab() {
+    switch phase {
+    case .preparing, .awaitingPrimary, .capturingPoints:
+      alignmentHoldTracker.reset()
+      stableHoldProgress = 0
+      if !isCapturingPhoto {
+        camera.stop()
+      }
+    default:
+      break
+    }
+  }
+
   private func handleMotionSample(_ sample: MotionSample?) {
     currentMotionSample = sample
     guard phase == .capturingPoints,
+      isCaptureTabActive,
       !isCapturingPhoto,
       let sample,
       let captureReference
@@ -479,6 +553,7 @@ final class CaptureViewModel: ObservableObject {
         phase = .capturingPoints
         statusMessage =
           "Align center to a point · \(capturedFrames.count) of \(totalFrameCount)"
+        stopCameraIfCaptureTabInactive()
       }
     } catch {
       isCapturingPhoto = false
@@ -487,6 +562,7 @@ final class CaptureViewModel: ObservableObject {
       stableHoldProgress = 0
       captureErrorMessage = error.localizedDescription
       statusMessage = "Primary capture failed; try again"
+      stopCameraIfCaptureTabInactive()
     }
   }
 
@@ -533,6 +609,7 @@ final class CaptureViewModel: ObservableObject {
       } else {
         statusMessage =
           "Align center to a point · \(capturedFrames.count) of \(totalFrameCount)"
+        stopCameraIfCaptureTabInactive()
       }
     } catch {
       isCapturingPhoto = false
@@ -541,11 +618,13 @@ final class CaptureViewModel: ObservableObject {
       autoCaptureBlockedUntil = ProcessInfo.processInfo.systemUptime + 1
       captureErrorMessage = error.localizedDescription
       statusMessage = "Capture failed; realign to retry"
+      stopCameraIfCaptureTabInactive()
     }
   }
 
   private func finalizeCapture() async {
     statusMessage = "Saving capture to gallery"
+    await camera.unlockExposureFocusWhiteBalance()
     camera.stop()
     motion.stop()
 

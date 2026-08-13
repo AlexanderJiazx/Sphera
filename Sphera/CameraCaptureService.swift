@@ -55,6 +55,8 @@ final class CameraCaptureService: ObservableObject {
   private nonisolated(unsafe) var isConfigured = false
   private nonisolated(unsafe) var captureDevice: AVCaptureDevice?
   private nonisolated(unsafe) var maximumPhotoDimensions = CMVideoDimensions(width: 0, height: 0)
+  private nonisolated(unsafe) var sessionEpoch = 0
+  private nonisolated(unsafe) var areExposureParametersLocked = false
   private nonisolated let captureRotationDegrees = 90.0
 
   init(motionStore: LatestMotionSampleStore) {
@@ -65,36 +67,56 @@ final class CameraCaptureService: ObservableObject {
     )
   }
 
-  func start() async throws {
+  func start(restoreAuto: Bool = true) async throws {
     guard state != .running else { return }
+    sessionEpoch += 1
+    let epoch = sessionEpoch
     state = .configuring
 
     guard await requestCameraAuthorization() else {
+      guard epoch == sessionEpoch else { return }
       state = .failed(CameraCaptureError.permissionDenied.localizedDescription)
       throw CameraCaptureError.permissionDenied
     }
+    guard epoch == sessionEpoch else { return }
 
     do {
       try await performOnSessionQueue { [self] in
+        guard epoch == sessionEpoch else { return }
         if !isConfigured {
           try configureSession()
           isConfigured = true
+        } else if restoreAuto {
+          areExposureParametersLocked = false
+          if let captureDevice {
+            try Self.applyContinuousAutoExposureFocusWhiteBalance(on: captureDevice)
+          }
+        } else if areExposureParametersLocked, let captureDevice {
+          try Self.lockExposureFocusWhiteBalance(on: captureDevice)
         }
+        guard epoch == sessionEpoch else { return }
         guard !session.isRunning else { return }
         intrinsicsStore.clear()
         session.startRunning()
       }
+      guard epoch == sessionEpoch else { return }
       try await waitForIntrinsics()
+      guard epoch == sessionEpoch else { return }
       state = .running
     } catch {
+      guard epoch == sessionEpoch else { return }
       state = .failed(error.localizedDescription)
       throw error
     }
   }
 
   func stop() {
-    guard state != .idle else { return }
+    sessionEpoch += 1
     state = .idle
+    stopSessionIfRunning()
+  }
+
+  private func stopSessionIfRunning() {
     sessionQueue.async { [session] in
       if session.isRunning {
         session.stopRunning()
@@ -153,6 +175,17 @@ final class CameraCaptureService: ObservableObject {
         throw CameraCaptureError.sessionNotConfigured
       }
       try Self.lockExposureFocusWhiteBalance(on: captureDevice)
+      areExposureParametersLocked = true
+    }
+  }
+
+  /// Restores continuous AE/AF/AWB after a locked capture session.
+  func unlockExposureFocusWhiteBalance() async {
+    areExposureParametersLocked = false
+    guard state == .running else { return }
+    try? await performOnSessionQueue { [self] in
+      guard let captureDevice else { return }
+      try Self.applyContinuousAutoExposureFocusWhiteBalance(on: captureDevice)
     }
   }
 
@@ -327,19 +360,37 @@ final class CameraCaptureService: ObservableObject {
       defer { device.unlockForConfiguration() }
 
       device.videoZoomFactor = 1
-      if device.isFocusModeSupported(.continuousAutoFocus) {
-        device.focusMode = .continuousAutoFocus
-      }
-      if device.isExposureModeSupported(.continuousAutoExposure) {
-        device.exposureMode = .continuousAutoExposure
-      }
-      if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
-        device.whiteBalanceMode = .continuousAutoWhiteBalance
-      }
-      device.isSubjectAreaChangeMonitoringEnabled = true
+      Self.setContinuousAutoExposureFocusWhiteBalance(on: device)
     } catch {
       throw CameraCaptureError.couldNotConfigureDevice(error)
     }
+  }
+
+  private nonisolated static func applyContinuousAutoExposureFocusWhiteBalance(
+    on device: AVCaptureDevice
+  ) throws {
+    do {
+      try device.lockForConfiguration()
+      defer { device.unlockForConfiguration() }
+      Self.setContinuousAutoExposureFocusWhiteBalance(on: device)
+    } catch {
+      throw CameraCaptureError.couldNotConfigureDevice(error)
+    }
+  }
+
+  private nonisolated static func setContinuousAutoExposureFocusWhiteBalance(
+    on device: AVCaptureDevice
+  ) {
+    if device.isFocusModeSupported(.continuousAutoFocus) {
+      device.focusMode = .continuousAutoFocus
+    }
+    if device.isExposureModeSupported(.continuousAutoExposure) {
+      device.exposureMode = .continuousAutoExposure
+    }
+    if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
+      device.whiteBalanceMode = .continuousAutoWhiteBalance
+    }
+    device.isSubjectAreaChangeMonitoringEnabled = true
   }
 
   private func waitForIntrinsics(timeoutSeconds: Double = 3) async throws {

@@ -8,7 +8,7 @@ struct ContentView: View {
   var body: some View {
     TabView(selection: $selectedTab) {
       Tab("Capture", systemImage: "camera.fill", value: 0) {
-        CaptureTabView(model: model)
+        CaptureTabView(model: model, isSelected: selectedTab == 0)
       }
 
       Tab("Gallery", systemImage: "photo.on.rectangle.angled", value: 1) {
@@ -24,6 +24,9 @@ struct ContentView: View {
       }
     }
     .preferredColorScheme(.dark)
+    .onChange(of: selectedTab, initial: true) { _, tab in
+      model.setCaptureTabActive(tab == 0)
+    }
     .onAppear {
       #if DEBUG
         guard !handledDebugLaunchArguments else { return }
@@ -73,6 +76,7 @@ struct ContentView: View {
 
 private struct CaptureTabView: View {
   @ObservedObject var model: CaptureViewModel
+  var isSelected: Bool
 
   var body: some View {
     Group {
@@ -98,13 +102,8 @@ private struct CaptureTabView: View {
         }
       }
     }
-    .onAppear {
-      if model.phase == .setup {
-        model.startCapture()
-      }
-    }
     .onChange(of: model.phase) { _, phase in
-      if phase == .setup {
+      if isSelected, phase == .setup {
         model.startCapture()
       }
     }
