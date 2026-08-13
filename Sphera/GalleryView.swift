@@ -4,6 +4,7 @@ import UniformTypeIdentifiers
 
 struct GalleryView: View {
   @ObservedObject var model: CaptureViewModel
+  @Namespace private var galleryZoom
   @State private var sharePayload: SharePayload?
   @State private var shareErrorMessage: String?
   @State private var isPreparingShare = false
@@ -28,13 +29,9 @@ struct GalleryView: View {
           LazyVGrid(columns: columns, spacing: 12) {
             ForEach(model.galleryPackages, id: \.manifest.sessionID) { package in
               NavigationLink {
-                GalleryDetailView(
-                  model: model,
-                  package: package,
-                  onShare: { await presentShare(for: package) }
-                )
+                galleryDestination(for: package)
               } label: {
-                GalleryGridCard(package: package)
+                GalleryGridCard(package: package, zoomNamespace: galleryZoom)
               }
               .buttonStyle(.plain)
               .contextMenu {
@@ -102,6 +99,24 @@ struct GalleryView: View {
     }
   }
 
+  @ViewBuilder
+  private func galleryDestination(for package: CapturePackage) -> some View {
+    if package.hasPanorama {
+      GalleryPanoramaView(
+        model: model,
+        package: package,
+        onShare: { await presentShare(for: package) }
+      )
+      .navigationTransition(.zoom(sourceID: package.manifest.sessionID, in: galleryZoom))
+    } else {
+      GalleryDetailView(
+        model: model,
+        package: package,
+        onShare: { await presentShare(for: package) }
+      )
+    }
+  }
+
   @MainActor
   private func presentShare(for package: CapturePackage) async {
     isPreparingShare = true
@@ -117,29 +132,11 @@ struct GalleryView: View {
 
 private struct GalleryGridCard: View {
   let package: CapturePackage
+  var zoomNamespace: Namespace.ID
 
   var body: some View {
     VStack(alignment: .leading, spacing: 0) {
-      preview
-        .frame(maxWidth: .infinity)
-        .aspectRatio(1, contentMode: .fit)
-        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-        .overlay(alignment: .topTrailing) {
-          if package.hasPanorama {
-            Image(systemName: "pano.fill")
-              .font(.caption.weight(.bold))
-              .foregroundStyle(.white)
-              .padding(6)
-              .background(.black.opacity(0.55), in: Capsule())
-              .padding(8)
-          }
-        }
-        .overlay {
-          RoundedRectangle(cornerRadius: 14, style: .continuous)
-            .strokeBorder(.white.opacity(0.12), lineWidth: 1)
-        }
-        .shadow(color: .black.opacity(0.35), radius: 8, y: 4)
-
+      thumbnail
       VStack(alignment: .leading, spacing: 2) {
         Text(package.manifest.completedAt ?? package.manifest.createdAt, format: .dateTime)
           .font(.subheadline.weight(.semibold))
@@ -154,6 +151,34 @@ private struct GalleryGridCard: View {
       .padding(.top, 8)
       .padding(.horizontal, 2)
     }
+  }
+
+  @ViewBuilder
+  private var thumbnail: some View {
+    let shape = RoundedRectangle(cornerRadius: 14, style: .continuous)
+    preview
+      .frame(maxWidth: .infinity)
+      .aspectRatio(1, contentMode: .fit)
+      .clipShape(shape)
+      .overlay(alignment: .topTrailing) {
+        if package.hasPanorama {
+          Image(systemName: "pano.fill")
+            .font(.caption.weight(.bold))
+            .foregroundStyle(.white)
+            .padding(6)
+            .background(.black.opacity(0.55), in: Capsule())
+            .padding(8)
+        }
+      }
+      .overlay {
+        shape.strokeBorder(.white.opacity(0.12), lineWidth: 1)
+      }
+      .shadow(color: .black.opacity(0.35), radius: 8, y: 4)
+      .galleryZoomSource(
+        id: package.manifest.sessionID,
+        namespace: zoomNamespace,
+        enabled: package.hasPanorama
+      )
   }
 
   @ViewBuilder
@@ -176,10 +201,102 @@ private struct GalleryGridCard: View {
   }
 }
 
+private struct GalleryPanoramaView: View {
+  @ObservedObject var model: CaptureViewModel
+  let package: CapturePackage
+  let onShare: () async -> Void
+
+  @Environment(\.dismiss) private var dismiss
+  @State private var showInfo = false
+  @State private var revealPanorama = false
+
+  private var livePackage: CapturePackage {
+    model.galleryPackages.first {
+      $0.manifest.sessionID == package.manifest.sessionID
+    } ?? package
+  }
+
+  private var previewImage: UIImage? {
+    guard let url = livePackage.previewImageURL else { return nil }
+    return UIImage(contentsOfFile: url.path)
+  }
+
+  var body: some View {
+    ZStack {
+      Color.black
+      PanoramaViewer(imageURL: livePackage.panoramaURL)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+      if let previewImage {
+        Image(uiImage: previewImage)
+          .resizable()
+          .scaledToFill()
+          .frame(maxWidth: .infinity, maxHeight: .infinity)
+          .clipped()
+          .opacity(revealPanorama ? 0 : 1)
+          .allowsHitTesting(false)
+          .accessibilityHidden(true)
+      }
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(Color.black)
+    .ignoresSafeArea()
+    .navigationTitle("")
+    .navigationBarTitleDisplayMode(.inline)
+    .containerBackground(.black, for: .navigation)
+    .toolbarBackground(.hidden, for: .navigationBar)
+    .toolbarBackgroundVisibility(.hidden, for: .navigationBar)
+    .toolbarColorScheme(.dark, for: .navigationBar)
+    .toolbar {
+      ToolbarItem(placement: .topBarTrailing) {
+        Button {
+          showInfo = true
+        } label: {
+          Image(systemName: "info.circle")
+        }
+        .accessibilityLabel("Capture details")
+      }
+    }
+    .toolbar(.hidden, for: .tabBar)
+    .toolbarVisibility(.hidden, for: .tabBar)
+    .task {
+      try? await Task.sleep(for: .milliseconds(480))
+      withAnimation(.easeOut(duration: 0.35)) {
+        revealPanorama = true
+      }
+    }
+    .onChange(of: model.phase) { _, phase in
+      if phase == .stitching {
+        showInfo = false
+      }
+    }
+    .sheet(isPresented: $showInfo) {
+      NavigationStack {
+        GalleryDetailView(
+          model: model,
+          package: livePackage,
+          onShare: onShare,
+          showsPanoramaLink: false,
+          onDeleted: {
+            showInfo = false
+            dismiss()
+          }
+        )
+        .toolbar {
+          ToolbarItem(placement: .confirmationAction) {
+            Button("Done") { showInfo = false }
+          }
+        }
+      }
+    }
+  }
+}
+
 struct GalleryDetailView: View {
   @ObservedObject var model: CaptureViewModel
   let package: CapturePackage
   let onShare: () async -> Void
+  var showsPanoramaLink: Bool = true
+  var onDeleted: (() -> Void)? = nil
 
   @Environment(\.dismiss) private var dismiss
   @State private var isSharing = false
@@ -308,11 +425,23 @@ struct GalleryDetailView: View {
       Button(role: .destructive) {
         Task {
           await model.deleteFromGallery(package)
-          dismiss()
+          if let onDeleted {
+            onDeleted()
+          } else {
+            dismiss()
+          }
         }
       } label: {
-        Label("Delete capture", systemImage: "trash")
+        Label {
+          Text("Delete capture")
+        } icon: {
+          Image(systemName: "trash")
+            .symbolRenderingMode(.monochrome)
+            .foregroundStyle(.red)
+        }
       }
+      .tint(.red)
+      .foregroundStyle(.red)
     } footer: {
       Text(
         "On-device stitching uses sensor-first SIFT (no ML models). LoFTR remains an optional offline diagnostic only—share the archive if you need to compare Engine oracle outputs."
@@ -323,12 +452,16 @@ struct GalleryDetailView: View {
   @ViewBuilder
   private var panoramaActions: some View {
     if livePackage.hasPanorama {
-      NavigationLink {
-        PanoramaViewer(imageURL: livePackage.panoramaURL)
-          .navigationTitle("Panorama")
-          .navigationBarTitleDisplayMode(.inline)
-      } label: {
-        Label("View panorama", systemImage: "pano")
+      if showsPanoramaLink {
+        NavigationLink {
+          GalleryPanoramaView(
+            model: model,
+            package: livePackage,
+            onShare: onShare
+          )
+        } label: {
+          Label("View panorama", systemImage: "pano")
+        }
       }
 
       Button {
@@ -397,4 +530,15 @@ struct ActivityView: UIViewControllerRepresentable {
   }
 
   func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
+}
+
+private extension View {
+  @ViewBuilder
+  func galleryZoomSource(id: UUID, namespace: Namespace.ID, enabled: Bool) -> some View {
+    if enabled {
+      matchedTransitionSource(id: id, in: namespace)
+    } else {
+      self
+    }
+  }
 }

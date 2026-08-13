@@ -7,27 +7,21 @@ struct ContentView: View {
 
   var body: some View {
     TabView(selection: $selectedTab) {
-      CaptureTabView(model: model)
-        .tabItem {
-          Label("Capture", systemImage: "camera.fill")
+      Tab("Capture", systemImage: "camera.fill", value: 0) {
+        CaptureTabView(model: model)
+      }
+
+      Tab("Gallery", systemImage: "photo.on.rectangle.angled", value: 1) {
+        NavigationStack {
+          GalleryView(model: model)
         }
-        .tag(0)
+      }
 
-      NavigationStack {
-        GalleryView(model: model)
+      Tab("Settings", systemImage: "gearshape.fill", value: 2) {
+        NavigationStack {
+          SettingsView(model: model)
+        }
       }
-      .tabItem {
-        Label("Gallery", systemImage: "photo.on.rectangle.angled")
-      }
-      .tag(1)
-
-      NavigationStack {
-        SettingsView(model: model)
-      }
-      .tabItem {
-        Label("Settings", systemImage: "gearshape.fill")
-      }
-      .tag(2)
     }
     .preferredColorScheme(.dark)
     .onAppear {
@@ -172,7 +166,6 @@ private struct CaptureScreen: View {
       if !isAwaitingPrimary {
         CapturePointGuideView(
           points: model.guidePoints,
-          holdProgress: model.stableHoldProgress,
           isCapturingPhoto: model.isCapturingPhoto
         )
         .ignoresSafeArea()
@@ -234,7 +227,10 @@ private struct CaptureScreen: View {
         }
       }
       if !isAwaitingPrimary {
-        ProgressView(value: model.progressFraction)
+        CaptureSegmentProgress(
+          total: model.totalFrameCount,
+          capturedCount: model.capturedFrames.count
+        )
       }
     }
     .padding(14)
@@ -262,6 +258,39 @@ private struct CaptureScreen: View {
     .opacity(model.isCapturingPhoto ? 0.55 : 1)
     .accessibilityLabel("Capture primary photo")
     .padding(.bottom, 22)
+  }
+}
+
+private struct CaptureSegmentProgress: View {
+  let total: Int
+  let capturedCount: Int
+
+  var body: some View {
+    HStack(spacing: 3) {
+      ForEach(0..<max(total, 0), id: \.self) { index in
+        segment(at: index)
+      }
+    }
+    .frame(height: 8)
+    .accessibilityElement(children: .ignore)
+    .accessibilityLabel("Capture progress, \(capturedCount) of \(total) photos")
+  }
+
+  private func segment(at index: Int) -> some View {
+    let captured = index < capturedCount
+    let current = index == capturedCount
+    let shape = RoundedRectangle(cornerRadius: 2.5, style: .continuous)
+    return shape
+      .fill(captured ? Color.blue : Color.clear)
+      .overlay {
+        shape.strokeBorder(
+          current ? Color.white : Color.white.opacity(captured ? 0 : 0.28),
+          lineWidth: current ? 1.6 : 1
+        )
+      }
+      .frame(maxWidth: .infinity)
+      .animation(.easeInOut(duration: 0.2), value: captured)
+      .animation(.easeInOut(duration: 0.2), value: current)
   }
 }
 

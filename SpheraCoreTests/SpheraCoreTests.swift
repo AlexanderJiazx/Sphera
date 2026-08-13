@@ -817,6 +817,17 @@ func primaryCaptureMetadataPersisted() async throws {
   #expect(package.manifest.primaryCapture?.targetId == target.id)
   #expect(package.manifest.primaryCapture?.classifiedRing == .horizontal)
   #expect(package.manifest.frames.map(\.imageFilename).first == "000_horizontal_00.jpg")
+  #expect(package.previewImageURL == package.primaryImageURL)
+
+  let engineOutput = package.directoryURL.appendingPathComponent(
+    "engine-output",
+    isDirectory: true
+  )
+  try FileManager.default.createDirectory(at: engineOutput, withIntermediateDirectories: true)
+  try Data("pano".utf8).write(to: package.panoramaURL)
+  #expect(package.hasPanorama)
+  #expect(package.previewImageURL == package.primaryImageURL)
+  #expect(package.previewImageURL != package.panoramaURL)
 }
 
 @Test("Schema 5 manifests without primaryCapture still decode")

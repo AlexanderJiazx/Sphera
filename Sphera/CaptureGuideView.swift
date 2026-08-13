@@ -4,7 +4,6 @@ import SwiftUI
 /// rotating arrow that always points toward the nearest remaining capture point.
 struct CapturePointGuideView: View {
   let points: [CapturePointProjection]
-  let holdProgress: Double
   let isCapturingPhoto: Bool
 
   /// Radians of visual angle mapped across half the shorter screen axis.
@@ -37,17 +36,6 @@ struct CapturePointGuideView: View {
             angleRadians: atan2(nearest.offsetY, nearest.offsetX)
           )
           .position(center)
-        }
-
-        VStack {
-          Spacer()
-          GuideInstructionBar(
-            nearest: nearest,
-            holdProgress: holdProgress,
-            isCapturingPhoto: isCapturingPhoto
-          )
-          .padding(.horizontal, 20)
-          .padding(.bottom, 28)
         }
       }
       .frame(width: size.width, height: size.height)
@@ -146,53 +134,6 @@ private struct GuidePointDot: View {
     case .downward: .orange
     case .upward: .mint
     }
-  }
-}
-
-private struct GuideInstructionBar: View {
-  let nearest: CapturePointProjection?
-  let holdProgress: Double
-  let isCapturingPhoto: Bool
-
-  var body: some View {
-    VStack(spacing: 10) {
-      Text(title)
-        .font(.system(size: 28, weight: .black, design: .rounded))
-        .foregroundStyle(.primary)
-        .minimumScaleFactor(0.7)
-        .lineLimit(1)
-
-      Text(detail)
-        .font(.subheadline.weight(.semibold))
-        .foregroundStyle(.secondary)
-        .multilineTextAlignment(.center)
-
-      if nearest?.isAligned == true {
-        ProgressView(value: min(1, max(0, holdProgress)))
-          .tint(.green)
-          .frame(maxWidth: 200)
-      }
-    }
-    .frame(maxWidth: .infinity)
-    .padding(.horizontal, 20)
-    .padding(.vertical, 16)
-    .liquidGlass(in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-  }
-
-  private var title: String {
-    if isCapturingPhoto { return "CAPTURING" }
-    if nearest?.isAligned == true { return "HOLD STILL" }
-    if nearest != nil { return "FOLLOW ARROW" }
-    return "FIND A POINT"
-  }
-
-  private var detail: String {
-    if isCapturingPhoto { return "Keep the phone steady" }
-    if nearest?.isAligned == true { return "Auto capture when ready" }
-    if let nearest {
-      return "Aim at the \(nearest.ring.displayName.lowercased()) point"
-    }
-    return "Move until a target appears"
   }
 }
 

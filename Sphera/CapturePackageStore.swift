@@ -331,13 +331,27 @@ extension CapturePackage {
 
   var firstImageURL: URL? {
     guard let frame = manifest.frames.first else { return nil }
-    return directoryURL
-      .appendingPathComponent(manifest.imageDirectory, isDirectory: true)
-      .appendingPathComponent(frame.imageFilename)
+    return imageURL(for: frame.imageFilename)
   }
 
-  /// Prefer the stitched panorama when available; otherwise the first frame.
+  var primaryImageURL: URL? {
+    guard let filename = manifest.primaryCapture?.imageFilename, !filename.isEmpty else {
+      return nil
+    }
+    return imageURL(for: filename)
+  }
+
+  /// Gallery thumbnails use the primary capture still, then the first frame.
   var previewImageURL: URL? {
-    hasPanorama ? panoramaURL : firstImageURL
+    if let primaryImageURL, FileManager.default.fileExists(atPath: primaryImageURL.path) {
+      return primaryImageURL
+    }
+    return firstImageURL
+  }
+
+  private func imageURL(for filename: String) -> URL {
+    directoryURL
+      .appendingPathComponent(manifest.imageDirectory, isDirectory: true)
+      .appendingPathComponent(filename)
   }
 }
