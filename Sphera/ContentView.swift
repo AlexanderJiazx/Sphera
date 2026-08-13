@@ -58,6 +58,22 @@ struct ContentView: View {
         }
       #endif
     }
+    .overlay {
+      if selectedTab != 0 {
+        switch model.phase {
+        case .stitching:
+          ZStack {
+            Color.black.opacity(0.55).ignoresSafeArea()
+            StatusView(
+              title: "Computing panorama",
+              detail: model.statusMessage
+            )
+          }
+        default:
+          EmptyView()
+        }
+      }
+    }
   }
 }
 

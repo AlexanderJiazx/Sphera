@@ -28,7 +28,6 @@
 #include <cmath>
 #include <cstdio>
 #include <fstream>
-#include <future>
 #include <sstream>
 #include <stdexcept>
 #include <sys/resource.h>
@@ -583,19 +582,12 @@ StitchArtifacts PanoramaEngine::stitch(const StitchRequest &request) {
   const int64 graphCutStarted = cv::getTickCount();
   std::vector<std::pair<int, double>> graphCutRingSeconds;
   try {
-    struct RingGraphCutResult {
-      int ringId = 0;
-      std::vector<int> indices;
-      std::vector<cv::UMat> masks;
-      double elapsedSeconds = 0;
-    };
     std::vector<int> ringIds;
     for (const PoseFrameLayout &layout : layouts) {
       ringIds.push_back(layout.ring);
     }
     std::sort(ringIds.begin(), ringIds.end());
     ringIds.erase(std::unique(ringIds.begin(), ringIds.end()), ringIds.end());
-    std::vector<std::future<RingGraphCutResult>> pending;
     for (int ringId : ringIds) {
       std::vector<int> indices;
       std::vector<cv::UMat> ringImages;
@@ -613,31 +605,17 @@ StitchArtifacts PanoramaEngine::stitch(const StitchRequest &request) {
       if (indices.size() < 2) {
         continue;
       }
-      pending.push_back(std::async(
-          std::launch::async,
-          [ringId, indices = std::move(indices),
-           ringImages = std::move(ringImages),
-           ringCorners = std::move(ringCorners),
-           ringMasks = std::move(ringMasks)]() mutable {
-            const int64 ringStarted = cv::getTickCount();
-            cv::detail::GraphCutSeamFinder seamFinder(
-                cv::detail::GraphCutSeamFinderBase::COST_COLOR);
-            seamFinder.find(ringImages, ringCorners, ringMasks);
-            RingGraphCutResult result;
-            result.ringId = ringId;
-            result.indices = std::move(indices);
-            result.masks = std::move(ringMasks);
-            result.elapsedSeconds =
-                (cv::getTickCount() - ringStarted) / cv::getTickFrequency();
-            return result;
-          }));
-    }
-    for (auto &future : pending) {
-      RingGraphCutResult result = future.get();
-      graphCutRingSeconds.emplace_back(result.ringId, result.elapsedSeconds);
-      for (std::size_t local = 0; local < result.indices.size(); ++local) {
-        result.masks[local].copyTo(seamMasksU[static_cast<std::size_t>(
-            result.indices[local])]);
+      // Sequential on purpose: concurrent GraphCutSeamFinder + UMat deadlocks
+      // on iOS (nested OpenCV parallelism / shared OpenCL context).
+      const int64 ringStarted = cv::getTickCount();
+      cv::detail::GraphCutSeamFinder seamFinder(
+          cv::detail::GraphCutSeamFinderBase::COST_COLOR);
+      seamFinder.find(ringImages, ringCorners, ringMasks);
+      graphCutRingSeconds.emplace_back(
+          ringId, (cv::getTickCount() - ringStarted) / cv::getTickFrequency());
+      for (std::size_t local = 0; local < indices.size(); ++local) {
+        ringMasks[local].copyTo(
+            seamMasksU[static_cast<std::size_t>(indices[local])]);
       }
     }
   } catch (const cv::Exception &) {
@@ -647,7 +625,7 @@ StitchArtifacts PanoramaEngine::stitch(const StitchRequest &request) {
           seamMasksU[static_cast<std::size_t>(index)]);
     }
   } catch (const std::exception &) {
-    seamStatus = "adaptive-ring-seam-fallback-after-concurrency-error";
+    seamStatus = "adaptive-ring-seam-fallback-after-graphcut-error";
     for (int index = 0; index < frameCount; ++index) {
       warpedMasks[static_cast<std::size_t>(index)].copyTo(
           seamMasksU[static_cast<std::size_t>(index)]);

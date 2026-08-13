@@ -263,6 +263,7 @@ final class CaptureViewModel: ObservableObject {
       statusMessage = replaceExisting
         ? "Panorama recompute failed"
         : "On-device compute failed"
+      galleryErrorMessage = error.localizedDescription
     }
   }
 

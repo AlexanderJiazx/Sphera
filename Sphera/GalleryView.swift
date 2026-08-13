@@ -197,7 +197,7 @@ struct GalleryDetailView: View {
       ) {
         Button("Recompute") {
           Task {
-            await model.computeOnDevice(package: package, replaceExisting: true)
+            await model.computeOnDevice(package: livePackage, replaceExisting: true)
           }
         }
         Button("Cancel", role: .cancel) {}
@@ -210,6 +210,13 @@ struct GalleryDetailView: View {
         allowsMultipleSelection: true,
         onCompletion: handleEngineImport
       )
+      .disabled(model.phase == .stitching)
+  }
+
+  private var livePackage: CapturePackage {
+    model.galleryPackages.first {
+      $0.manifest.sessionID == package.manifest.sessionID
+    } ?? package
   }
 
   private var detailList: some View {
@@ -224,7 +231,7 @@ struct GalleryDetailView: View {
   @ViewBuilder
   private var previewSection: some View {
     Section {
-      if let url = package.previewImageURL,
+      if let url = livePackage.previewImageURL,
         let image = UIImage(contentsOfFile: url.path)
       {
         Image(uiImage: image)
@@ -246,7 +253,7 @@ struct GalleryDetailView: View {
       )
       LabeledContent(
         "On-device panorama",
-        value: package.hasPanorama ? "Ready" : "Not computed"
+        value: livePackage.hasPanorama ? "Ready" : "Not computed"
       )
       LabeledContent("Motion frame", value: package.manifest.coreMotionReferenceFrame)
     }
@@ -315,9 +322,9 @@ struct GalleryDetailView: View {
 
   @ViewBuilder
   private var panoramaActions: some View {
-    if package.hasPanorama {
+    if livePackage.hasPanorama {
       NavigationLink {
-        PanoramaViewer(imageURL: package.panoramaURL)
+        PanoramaViewer(imageURL: livePackage.panoramaURL)
           .navigationTitle("Panorama")
           .navigationBarTitleDisplayMode(.inline)
       } label: {
@@ -332,7 +339,7 @@ struct GalleryDetailView: View {
     } else {
       Button {
         Task {
-          await model.computeOnDevice(package: package)
+          await model.computeOnDevice(package: livePackage)
         }
       } label: {
         Label("Compute on device", systemImage: "cpu")
