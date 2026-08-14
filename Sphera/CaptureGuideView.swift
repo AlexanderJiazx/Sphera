@@ -33,7 +33,7 @@ struct CapturePointGuideView: View {
 
         if let nearest, !isAligned {
           AimingArrow(
-            angleRadians: atan2(nearest.offsetY, nearest.offsetX)
+            angleRadians: nearest.aimingAngleRadians
           )
           .position(center)
         }
@@ -72,9 +72,12 @@ private struct PositionedPoint: Identifiable {
 }
 
 /// Continuous 360° arrow. `angleRadians` uses screen coords (+x right, +y down);
-/// 0 points right. `arrow.right` is rotated to match.
+/// 0 points right. Shortest-path angle unwrapping prevents rapid 360° spinning
+/// when crossing the ±π boundary.
 private struct AimingArrow: View {
   let angleRadians: Double
+  @State private var continuousAngle: Double = 0
+  @State private var hasInitialized = false
 
   var body: some View {
     Image(systemName: "arrow.right")
@@ -82,9 +85,24 @@ private struct AimingArrow: View {
       .foregroundStyle(.white)
       .shadow(color: .black.opacity(0.55), radius: 4, y: 2)
       .offset(x: 58)
-      .rotationEffect(.radians(angleRadians))
-      .animation(.interactiveSpring(response: 0.22, dampingFraction: 0.86), value: angleRadians)
+      .rotationEffect(.radians(continuousAngle))
+      .animation(.interactiveSpring(response: 0.22, dampingFraction: 0.86), value: continuousAngle)
       .accessibilityLabel("Aim toward nearest point")
+      .onAppear {
+        continuousAngle = angleRadians
+        hasInitialized = true
+      }
+      .onChange(of: angleRadians) { _, newAngle in
+        guard hasInitialized else {
+          continuousAngle = newAngle
+          hasInitialized = true
+          return
+        }
+        var delta = (newAngle - continuousAngle).truncatingRemainder(dividingBy: 2 * .pi)
+        if delta > .pi { delta -= 2 * .pi }
+        if delta < -.pi { delta += 2 * .pi }
+        continuousAngle += delta
+      }
   }
 }
 

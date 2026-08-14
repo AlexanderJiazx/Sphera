@@ -231,6 +231,8 @@ enum OrientationMath {
   /// Projects a target direction into normalized screen offsets from the optical
   /// center. `x`/`y` are approximately radians of visual angle (positive x = right,
   /// positive y = down). `isInFront` is false when the target is behind the camera.
+  /// `aimingAngleRadians` gives the screen angle pointing toward the target regardless of
+  /// whether the target is in front or behind the optical axis.
   static func projectTargetToScreen(
     sample: MotionSample,
     captureReference: CaptureReferenceFrame,
@@ -248,9 +250,27 @@ enum OrientationMath {
     )
     let forward = directionInCamera.z
     let isInFront = forward > 0.02
-    let safeForward = max(abs(forward), 0.02) * (forward >= 0 ? 1 : -1)
+    let safeForward = max(forward, 0.02)
     let offsetX = directionInCamera.x / safeForward
     let offsetY = directionInCamera.y / safeForward
+
+    let planarLength = hypot(directionInCamera.x, directionInCamera.y)
+    let aimingAngle: Double
+    if planarLength > 0.001 {
+      aimingAngle = atan2(directionInCamera.y, directionInCamera.x)
+    } else if forward < 0 {
+      let currentPitch = asin(min(1, max(-1, simd_act(currentCamera, SIMD3<Double>(0, 0, 1)).y))).degrees
+      if target.pitchDegrees > currentPitch + 1 {
+        aimingAngle = -.pi / 2
+      } else if target.pitchDegrees < currentPitch - 1 {
+        aimingAngle = .pi / 2
+      } else {
+        aimingAngle = 0
+      }
+    } else {
+      aimingAngle = 0
+    }
+
     let reading = navigationReading(
       sample: sample,
       captureReference: captureReference,
@@ -262,6 +282,7 @@ enum OrientationMath {
       ring: target.ring,
       offsetX: offsetX,
       offsetY: offsetY,
+      aimingAngleRadians: aimingAngle,
       directionErrorDegrees: reading.directionErrorDegrees,
       isInFront: isInFront,
       isAligned: false
@@ -357,6 +378,8 @@ struct CapturePointProjection: Equatable, Identifiable, Sendable {
   /// Approximate radians of visual angle from optical center; +x right, +y down.
   let offsetX: Double
   let offsetY: Double
+  /// Screen angle in radians pointing toward target (+x right, +y down).
+  let aimingAngleRadians: Double
   let directionErrorDegrees: Double
   let isInFront: Bool
   let isAligned: Bool

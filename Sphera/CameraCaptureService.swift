@@ -28,6 +28,32 @@ final class LatestCameraIntrinsicsStore: @unchecked Sendable {
   }
 }
 
+struct CameraManualControlCapabilities: Equatable, Sendable {
+  let minISO: Float
+  let maxISO: Float
+  let currentISO: Float
+  let minExposureDurationSeconds: Double
+  let maxExposureDurationSeconds: Double
+  let currentExposureDurationSeconds: Double
+  let currentLensPosition: Float
+  let minTemperatureKelvin: Float
+  let maxTemperatureKelvin: Float
+  let currentTemperatureKelvin: Float
+
+  static let `default` = CameraManualControlCapabilities(
+    minISO: 50,
+    maxISO: 2000,
+    currentISO: 100,
+    minExposureDurationSeconds: 1.0 / 8000.0,
+    maxExposureDurationSeconds: 1.0 / 2.0,
+    currentExposureDurationSeconds: 1.0 / 125.0,
+    currentLensPosition: 0.5,
+    minTemperatureKelvin: 2500,
+    maxTemperatureKelvin: 9000,
+    currentTemperatureKelvin: 5500
+  )
+}
+
 @MainActor
 final class CameraCaptureService: ObservableObject {
   enum State: Equatable {
@@ -38,6 +64,7 @@ final class CameraCaptureService: ObservableObject {
   }
 
   @Published private(set) var state: State = .idle
+  @Published private(set) var isFeedActive = false
 
   nonisolated(unsafe) let session = AVCaptureSession()
 
@@ -61,10 +88,24 @@ final class CameraCaptureService: ObservableObject {
 
   init(motionStore: LatestMotionSampleStore) {
     self.motionStore = motionStore
-    videoMetadataDelegate = VideoFrameMetadataDelegate(
-      store: intrinsicsStore,
-      captureRotationDegrees: captureRotationDegrees
+    let intrinsics = intrinsicsStore
+    let rotationDegrees = captureRotationDegrees
+    let delegate = VideoFrameMetadataDelegate(
+      store: intrinsics,
+      captureRotationDegrees: rotationDegrees,
+      onFrameReceived: nil
     )
+    self.videoMetadataDelegate = delegate
+    delegate.setOnFrameReceived { [weak self] in
+      Task { @MainActor [weak self] in
+        guard let self, !self.isFeedActive else { return }
+        self.isFeedActive = true
+      }
+    }
+  }
+
+  func configureDelegate(onFirstFrame: @escaping @MainActor () -> Void) {
+    // Convenience if needed
   }
 
   func start(restoreAuto: Bool = true) async throws {
@@ -72,6 +113,7 @@ final class CameraCaptureService: ObservableObject {
     sessionEpoch += 1
     let epoch = sessionEpoch
     state = .configuring
+    isFeedActive = false
 
     guard await requestCameraAuthorization() else {
       guard epoch == sessionEpoch else { return }
@@ -103,6 +145,7 @@ final class CameraCaptureService: ObservableObject {
       try await waitForIntrinsics()
       guard epoch == sessionEpoch else { return }
       state = .running
+      isFeedActive = true
     } catch {
       guard epoch == sessionEpoch else { return }
       state = .failed(error.localizedDescription)
@@ -113,7 +156,175 @@ final class CameraCaptureService: ObservableObject {
   func stop() {
     sessionEpoch += 1
     state = .idle
+    isFeedActive = false
     stopSessionIfRunning()
+  }
+
+  func queryCapabilities() -> CameraManualControlCapabilities? {
+    guard let device = captureDevice else { return nil }
+    let format = device.activeFormat
+    let duration = CMTimeGetSeconds(device.exposureDuration)
+    let safeDuration = duration.isFinite && duration > 0 ? duration : 1.0 / 125.0
+    let tempAndTint = device.temperatureAndTintValues(for: device.deviceWhiteBalanceGains)
+    let temp = tempAndTint.temperature
+    let safeTemp = temp.isFinite && temp > 1000 ? temp : 5500.0
+
+    return CameraManualControlCapabilities(
+      minISO: format.minISO,
+      maxISO: format.maxISO,
+      currentISO: device.iso,
+      minExposureDurationSeconds: CMTimeGetSeconds(format.minExposureDuration),
+      maxExposureDurationSeconds: CMTimeGetSeconds(format.maxExposureDuration),
+      currentExposureDurationSeconds: safeDuration,
+      currentLensPosition: device.lensPosition,
+      minTemperatureKelvin: 2500,
+      maxTemperatureKelvin: 9000,
+      currentTemperatureKelvin: safeTemp
+    )
+  }
+
+  func applyCameraSettings(
+    isShutterAuto: Bool,
+    shutterDuration: Double,
+    isISOAuto: Bool,
+    iso: Float,
+    isFocusAuto: Bool,
+    focusLensPosition: Float,
+    isWhiteBalanceAuto: Bool,
+    temperatureKelvin: Float
+  ) async throws {
+    guard state == .running else { return }
+    try await performOnSessionQueue { [self] in
+      guard let device = captureDevice else { return }
+      try device.lockForConfiguration()
+      defer { device.unlockForConfiguration() }
+
+      let format = device.activeFormat
+
+      // 1. Exposure (Shutter Speed & ISO)
+      if isShutterAuto && isISOAuto {
+        if device.isExposureModeSupported(.continuousAutoExposure) {
+          device.exposureMode = .continuousAutoExposure
+        }
+      } else if device.isExposureModeSupported(.custom) {
+        let targetISO: Float
+        if isISOAuto {
+          targetISO = min(max(device.iso, format.minISO), format.maxISO)
+        } else {
+          targetISO = min(max(iso, format.minISO), format.maxISO)
+        }
+
+        let minDur = CMTimeGetSeconds(format.minExposureDuration)
+        let maxDur = CMTimeGetSeconds(format.maxExposureDuration)
+        let targetDuration: Double
+        if isShutterAuto {
+          let currentDur = CMTimeGetSeconds(device.exposureDuration)
+          targetDuration = currentDur.isFinite && currentDur > 0 ? min(max(currentDur, minDur), maxDur) : 1.0 / 125.0
+        } else {
+          targetDuration = min(max(shutterDuration, minDur), maxDur)
+        }
+        let time = CMTime(seconds: targetDuration, preferredTimescale: 1_000_000)
+        device.setExposureModeCustom(duration: time, iso: targetISO, completionHandler: nil)
+      }
+
+      // 2. Focus
+      if isFocusAuto {
+        if device.isFocusModeSupported(.continuousAutoFocus) {
+          device.focusMode = .continuousAutoFocus
+        } else if device.isFocusModeSupported(.autoFocus) {
+          device.focusMode = .autoFocus
+        }
+      } else if device.isLockingFocusWithCustomLensPositionSupported {
+        let clampedFocus = min(max(focusLensPosition, 0), 1)
+        device.setFocusModeLocked(lensPosition: clampedFocus, completionHandler: nil)
+      }
+
+      // 3. White Balance
+      if isWhiteBalanceAuto {
+        if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
+          device.whiteBalanceMode = .continuousAutoWhiteBalance
+        }
+      } else if device.isLockingWhiteBalanceWithCustomDeviceGainsSupported {
+        let clampedTemp = min(max(temperatureKelvin, 2500), 9000)
+        let tempAndTint = AVCaptureDevice.WhiteBalanceTemperatureAndTintValues(
+          temperature: clampedTemp,
+          tint: 0
+        )
+        var gains = device.deviceWhiteBalanceGains(for: tempAndTint)
+        let maxGain = device.maxWhiteBalanceGain
+        gains.redGain = min(max(gains.redGain, 1), maxGain)
+        gains.greenGain = min(max(gains.greenGain, 1), maxGain)
+        gains.blueGain = min(max(gains.blueGain, 1), maxGain)
+        device.setWhiteBalanceModeLocked(with: gains, completionHandler: nil)
+      }
+
+      areExposureParametersLocked = (!isShutterAuto || !isISOAuto || !isFocusAuto || !isWhiteBalanceAuto)
+    }
+  }
+
+  func setManualExposure(iso: Float, durationSeconds: Double) async throws {
+    guard state == .running else { return }
+    try await performOnSessionQueue { [self] in
+      guard let device = captureDevice else { return }
+      try device.lockForConfiguration()
+      defer { device.unlockForConfiguration() }
+      if device.isExposureModeSupported(.custom) {
+        let format = device.activeFormat
+        let clampedISO = min(max(iso, format.minISO), format.maxISO)
+        let minDuration = CMTimeGetSeconds(format.minExposureDuration)
+        let maxDuration = CMTimeGetSeconds(format.maxExposureDuration)
+        let clampedDuration = min(max(durationSeconds, minDuration), maxDuration)
+        let time = CMTime(seconds: clampedDuration, preferredTimescale: 1_000_000)
+        device.setExposureModeCustom(duration: time, iso: clampedISO, completionHandler: nil)
+        areExposureParametersLocked = true
+      }
+    }
+  }
+
+  func setManualFocus(lensPosition: Float) async throws {
+    guard state == .running else { return }
+    try await performOnSessionQueue { [self] in
+      guard let device = captureDevice else { return }
+      try device.lockForConfiguration()
+      defer { device.unlockForConfiguration() }
+      let clamped = min(max(lensPosition, 0), 1)
+      if device.isLockingFocusWithCustomLensPositionSupported {
+        device.setFocusModeLocked(lensPosition: clamped, completionHandler: nil)
+        areExposureParametersLocked = true
+      }
+    }
+  }
+
+  func setManualWhiteBalance(temperatureKelvin: Float) async throws {
+    guard state == .running else { return }
+    try await performOnSessionQueue { [self] in
+      guard let device = captureDevice else { return }
+      try device.lockForConfiguration()
+      defer { device.unlockForConfiguration() }
+      let clampedTemp = min(max(temperatureKelvin, 2500), 9000)
+      let tempAndTint = AVCaptureDevice.WhiteBalanceTemperatureAndTintValues(
+        temperature: clampedTemp,
+        tint: 0
+      )
+      var gains = device.deviceWhiteBalanceGains(for: tempAndTint)
+      let maxGain = device.maxWhiteBalanceGain
+      gains.redGain = min(max(gains.redGain, 1), maxGain)
+      gains.greenGain = min(max(gains.greenGain, 1), maxGain)
+      gains.blueGain = min(max(gains.blueGain, 1), maxGain)
+      if device.isLockingWhiteBalanceWithCustomDeviceGainsSupported {
+        device.setWhiteBalanceModeLocked(with: gains, completionHandler: nil)
+        areExposureParametersLocked = true
+      }
+    }
+  }
+
+  func setAutoExposureFocusWhiteBalance() async throws {
+    areExposureParametersLocked = false
+    guard state == .running else { return }
+    try await performOnSessionQueue { [self] in
+      guard let device = captureDevice else { return }
+      try Self.applyContinuousAutoExposureFocusWhiteBalance(on: device)
+    }
   }
 
   private func stopSessionIfRunning() {
@@ -446,10 +657,20 @@ private final class VideoFrameMetadataDelegate: NSObject,
 {
   private let store: LatestCameraIntrinsicsStore
   private let captureRotationDegrees: Double
+  private var onFrameReceived: (@Sendable () -> Void)?
 
-  init(store: LatestCameraIntrinsicsStore, captureRotationDegrees: Double) {
+  init(
+    store: LatestCameraIntrinsicsStore,
+    captureRotationDegrees: Double,
+    onFrameReceived: (@Sendable () -> Void)? = nil
+  ) {
     self.store = store
     self.captureRotationDegrees = captureRotationDegrees
+    self.onFrameReceived = onFrameReceived
+  }
+
+  func setOnFrameReceived(_ callback: (@Sendable () -> Void)?) {
+    self.onFrameReceived = callback
   }
 
   func captureOutput(
@@ -457,6 +678,7 @@ private final class VideoFrameMetadataDelegate: NSObject,
     didOutput sampleBuffer: CMSampleBuffer,
     from connection: AVCaptureConnection
   ) {
+    onFrameReceived?()
     guard
       let attachment = CMGetAttachment(
         sampleBuffer,

@@ -19,13 +19,108 @@ enum CaptureWorkflowPhase: Equatable {
   case failed(String)
 }
 
+enum CameraMode: String, CaseIterable, Codable, Sendable {
+  case auto = "Auto"
+  case manual = "Manual"
+}
+
+enum ManualParameter: String, CaseIterable, Identifiable, Sendable {
+  case shutter = "Shutter"
+  case iso = "ISO"
+  case focus = "Focus"
+  case whiteBalance = "WB"
+
+  var id: String { rawValue }
+}
+
 @MainActor
 final class CaptureViewModel: ObservableObject {
-  @Published var configuration = CaptureConfiguration.debugPreset
+  private static let configurationKey = "sphera.captureConfiguration"
+  private static let autoFireCaptureKey = "sphera.autoFireCapture"
+  private static let cameraModeKey = "sphera.cameraMode"
+  private static let isShutterAutoKey = "sphera.isShutterAuto"
+  private static let isISOAutoKey = "sphera.isISOAuto"
+  private static let isFocusAutoKey = "sphera.isFocusAuto"
+  private static let isWhiteBalanceAutoKey = "sphera.isWhiteBalanceAuto"
+  private static let manualISOKey = "sphera.manualISO"
+  private static let manualExposureDurationKey = "sphera.manualExposureDuration"
+  private static let manualFocusLensPositionKey = "sphera.manualFocusLensPosition"
+  private static let manualTemperatureKelvinKey = "sphera.manualTemperatureKelvin"
+  private static let experimentalMetalStitchKey = "useExperimentalMetalStitch"
+
+  @Published var configuration: CaptureConfiguration {
+    didSet {
+      Self.saveConfiguration(configuration)
+    }
+  }
+  @Published var autoFireCapture: Bool {
+    didSet {
+      UserDefaults.standard.set(autoFireCapture, forKey: Self.autoFireCaptureKey)
+    }
+  }
+  @Published var cameraMode: CameraMode {
+    didSet {
+      UserDefaults.standard.set(cameraMode.rawValue, forKey: Self.cameraModeKey)
+      Task { await applyActiveCameraMode() }
+    }
+  }
+  @Published var isShutterAuto: Bool {
+    didSet {
+      UserDefaults.standard.set(isShutterAuto, forKey: Self.isShutterAutoKey)
+      if cameraMode == .manual { Task { await applyManualControls() } }
+    }
+  }
+  @Published var isISOAuto: Bool {
+    didSet {
+      UserDefaults.standard.set(isISOAuto, forKey: Self.isISOAutoKey)
+      if cameraMode == .manual { Task { await applyManualControls() } }
+    }
+  }
+  @Published var isFocusAuto: Bool {
+    didSet {
+      UserDefaults.standard.set(isFocusAuto, forKey: Self.isFocusAutoKey)
+      if cameraMode == .manual { Task { await applyManualControls() } }
+    }
+  }
+  @Published var isWhiteBalanceAuto: Bool {
+    didSet {
+      UserDefaults.standard.set(isWhiteBalanceAuto, forKey: Self.isWhiteBalanceAutoKey)
+      if cameraMode == .manual { Task { await applyManualControls() } }
+    }
+  }
+  @Published var selectedManualParameter: ManualParameter? = nil
+  @Published var manualISO: Float {
+    didSet {
+      UserDefaults.standard.set(manualISO, forKey: Self.manualISOKey)
+      if cameraMode == .manual { Task { await applyManualControls() } }
+    }
+  }
+  @Published var manualExposureDurationSeconds: Double {
+    didSet {
+      UserDefaults.standard.set(manualExposureDurationSeconds, forKey: Self.manualExposureDurationKey)
+      if cameraMode == .manual { Task { await applyManualControls() } }
+    }
+  }
+  @Published var manualFocusLensPosition: Float {
+    didSet {
+      UserDefaults.standard.set(manualFocusLensPosition, forKey: Self.manualFocusLensPositionKey)
+      if cameraMode == .manual { Task { await applyManualControls() } }
+    }
+  }
+  @Published var manualTemperatureKelvin: Float {
+    didSet {
+      UserDefaults.standard.set(manualTemperatureKelvin, forKey: Self.manualTemperatureKelvinKey)
+      if cameraMode == .manual { Task { await applyManualControls() } }
+    }
+  }
+  @Published var isManualControlPanelExpanded = false
+  @Published private(set) var manualCapabilities: CameraManualControlCapabilities = .default
+  @Published private(set) var isCameraSourceReady = false
+
   @Published private(set) var phase: CaptureWorkflowPhase = .setup
   @Published private(set) var plan = CapturePlan(configuration: .debugPreset)
   @Published private(set) var capturedFrames: [CapturedFrameRecord] = []
-  @Published private(set) var currentMotionSample: MotionSample?
+  private(set) var currentMotionSample: MotionSample?
   @Published private(set) var navigationReading = CaptureNavigationReading.unavailable
   @Published private(set) var guidePoints: [CapturePointProjection] = []
   @Published private(set) var activeTarget: CaptureTarget?
@@ -44,7 +139,6 @@ final class CaptureViewModel: ObservableObject {
   private let packageStore: CapturePackageStore
   /// When set (tests), compute always uses this stitcher and ignores the toggle.
   private let stitcherOverride: (any PanoramaStitching)?
-  private static let experimentalMetalStitchKey = "useExperimentalMetalStitch"
   /// Settings toggle, off by default. Does not change the stable OpenCV path
   /// unless the user turns this on.
   @Published var useExperimentalMetalStitch: Bool {
@@ -70,18 +164,92 @@ final class CaptureViewModel: ObservableObject {
   ) {
     let motion = MotionTrackingService()
     self.motion = motion
-    camera = CameraCaptureService(motionStore: motion.sampleStore)
+    let camera = CameraCaptureService(motionStore: motion.sampleStore)
+    self.camera = camera
     self.packageStore = packageStore
     self.stitcherOverride = stitcher
     useExperimentalMetalStitch = UserDefaults.standard.bool(
       forKey: Self.experimentalMetalStitchKey
     )
 
+    let loadedConfig = Self.loadSavedConfiguration()
+    self.configuration = loadedConfig
+    self.plan = CapturePlan(configuration: loadedConfig)
+    if UserDefaults.standard.object(forKey: Self.autoFireCaptureKey) != nil {
+      self.autoFireCapture = UserDefaults.standard.bool(forKey: Self.autoFireCaptureKey)
+    } else {
+      self.autoFireCapture = true
+    }
+    if let savedMode = UserDefaults.standard.string(forKey: Self.cameraModeKey),
+       let mode = CameraMode(rawValue: savedMode) {
+      self.cameraMode = mode
+    } else {
+      self.cameraMode = .auto
+    }
+    if UserDefaults.standard.object(forKey: Self.isShutterAutoKey) != nil {
+      self.isShutterAuto = UserDefaults.standard.bool(forKey: Self.isShutterAutoKey)
+    } else {
+      self.isShutterAuto = true
+    }
+    if UserDefaults.standard.object(forKey: Self.isISOAutoKey) != nil {
+      self.isISOAuto = UserDefaults.standard.bool(forKey: Self.isISOAutoKey)
+    } else {
+      self.isISOAuto = true
+    }
+    if UserDefaults.standard.object(forKey: Self.isFocusAutoKey) != nil {
+      self.isFocusAuto = UserDefaults.standard.bool(forKey: Self.isFocusAutoKey)
+    } else {
+      self.isFocusAuto = true
+    }
+    if UserDefaults.standard.object(forKey: Self.isWhiteBalanceAutoKey) != nil {
+      self.isWhiteBalanceAuto = UserDefaults.standard.bool(forKey: Self.isWhiteBalanceAutoKey)
+    } else {
+      self.isWhiteBalanceAuto = true
+    }
+    let savedISO = UserDefaults.standard.float(forKey: Self.manualISOKey)
+    self.manualISO = savedISO > 0 ? savedISO : 100
+    let savedDuration = UserDefaults.standard.double(forKey: Self.manualExposureDurationKey)
+    self.manualExposureDurationSeconds = savedDuration > 0 ? savedDuration : 1.0 / 125.0
+    let savedFocus = UserDefaults.standard.float(forKey: Self.manualFocusLensPositionKey)
+    self.manualFocusLensPosition = savedFocus > 0 ? savedFocus : 0.5
+    let savedTemp = UserDefaults.standard.float(forKey: Self.manualTemperatureKelvinKey)
+    self.manualTemperatureKelvin = savedTemp > 0 ? savedTemp : 5500
+
     motion.$currentSample
       .sink { [weak self] sample in
         self?.handleMotionSample(sample)
       }
       .store(in: &subscriptions)
+
+    Publishers.CombineLatest(camera.$isFeedActive, camera.$state)
+      .receive(on: DispatchQueue.main)
+      .sink { [weak self] isFeedActive, state in
+        guard let self else { return }
+        if state == .running && isFeedActive && self.isCaptureTabActive {
+          if !self.isCameraSourceReady {
+            self.isCameraSourceReady = true
+          }
+          self.refreshManualCapabilities()
+          if self.cameraMode == .manual {
+            Task { await self.applyManualControls() }
+          }
+        }
+      }
+      .store(in: &subscriptions)
+  }
+
+  private static func loadSavedConfiguration() -> CaptureConfiguration {
+    if let data = UserDefaults.standard.data(forKey: configurationKey),
+       let decoded = try? JSONDecoder().decode(CaptureConfiguration.self, from: data) {
+      return decoded
+    }
+    return .debugPreset
+  }
+
+  private static func saveConfiguration(_ config: CaptureConfiguration) {
+    if let encoded = try? JSONEncoder().encode(config) {
+      UserDefaults.standard.set(encoded, forKey: configurationKey)
+    }
   }
 
   /// Default remains the stable OpenCV engine. The experimental 3-second
@@ -124,6 +292,7 @@ final class CaptureViewModel: ObservableObject {
   func startCapture() {
     guard phase == .setup || phase.isTerminal else { return }
     rebuildPlan()
+    isCameraSourceReady = false
     phase = .preparing
     statusMessage = "Starting camera and motion"
     captureErrorMessage = nil
@@ -173,6 +342,7 @@ final class CaptureViewModel: ObservableObject {
   /// can start a fresh session.
   func resetCapture() {
     guard phase == .capturingPoints else { return }
+    isCameraSourceReady = false
     motion.stop()
     isCapturingPhoto = false
     stitchProgress = nil
@@ -196,6 +366,7 @@ final class CaptureViewModel: ObservableObject {
   }
 
   func stopCapture() {
+    isCameraSourceReady = false
     camera.stop()
     motion.stop()
     isCapturingPhoto = false
@@ -221,6 +392,7 @@ final class CaptureViewModel: ObservableObject {
   }
 
   func returnToSetup() {
+    isCameraSourceReady = false
     camera.stop()
     motion.stop()
     isCapturingPhoto = false
@@ -236,6 +408,63 @@ final class CaptureViewModel: ObservableObject {
     captureReference = nil
     capturedFrames = []
     plan = CapturePlan(configuration: configuration)
+  }
+
+  func setCameraMode(_ mode: CameraMode) {
+    cameraMode = mode
+    if mode != .manual {
+      selectedManualParameter = nil
+    }
+  }
+
+  func selectManualParameter(_ param: ManualParameter) {
+    if selectedManualParameter == param {
+      selectedManualParameter = nil
+    } else {
+      selectedManualParameter = param
+    }
+  }
+
+  func applyActiveCameraMode() async {
+    guard camera.state == .running else { return }
+    if cameraMode == .manual {
+      await applyManualControls()
+    } else {
+      try? await camera.setAutoExposureFocusWhiteBalance()
+    }
+  }
+
+  func applyManualControls() async {
+    guard camera.state == .running else { return }
+    try? await camera.applyCameraSettings(
+      isShutterAuto: isShutterAuto,
+      shutterDuration: manualExposureDurationSeconds,
+      isISOAuto: isISOAuto,
+      iso: manualISO,
+      isFocusAuto: isFocusAuto,
+      focusLensPosition: manualFocusLensPosition,
+      isWhiteBalanceAuto: isWhiteBalanceAuto,
+      temperatureKelvin: manualTemperatureKelvin
+    )
+  }
+
+  func refreshManualCapabilities() {
+    if let caps = camera.queryCapabilities() {
+      manualCapabilities = caps
+    }
+  }
+
+  func captureCurrentAlignedTarget() {
+    guard phase == .capturingPoints,
+      !isCapturingPhoto,
+      let target = activeTarget,
+      let reference = captureReference,
+      navigationReading.isAligned
+    else { return }
+    isCapturingPhoto = true
+    Task {
+      await capture(target: target, reference: reference)
+    }
   }
 
   func refreshGallery() async {
@@ -390,18 +619,28 @@ final class CaptureViewModel: ObservableObject {
       camera.stop()
       return
     }
-    try await camera.start(restoreAuto: restoreAuto)
+    let shouldRestoreAuto = cameraMode == .auto && restoreAuto
+    try await camera.start(restoreAuto: shouldRestoreAuto)
     guard isCaptureTabActive else {
       camera.stop()
       return
     }
+    if cameraMode == .manual {
+      await applyManualControls()
+    }
+    refreshManualCapabilities()
     switch camera.state {
     case .running, .configuring:
       break
     default:
-      try await camera.start(restoreAuto: restoreAuto)
+      try await camera.start(restoreAuto: shouldRestoreAuto)
       if !isCaptureTabActive {
         camera.stop()
+      } else {
+        if cameraMode == .manual {
+          await applyManualControls()
+        }
+        refreshManualCapabilities()
       }
     }
   }
@@ -442,11 +681,6 @@ final class CaptureViewModel: ObservableObject {
       let sample,
       let captureReference
     else {
-      if phase != .capturingPoints {
-        guidePoints = []
-        activeTarget = nil
-        navigationReading = .unavailable
-      }
       return
     }
 
@@ -486,6 +720,7 @@ final class CaptureViewModel: ObservableObject {
           ring: point.ring,
           offsetX: point.offsetX,
           offsetY: point.offsetY,
+          aimingAngleRadians: point.aimingAngleRadians,
           directionErrorDegrees: point.directionErrorDegrees,
           isInFront: point.isInFront,
           isAligned: reading.isAligned
@@ -508,16 +743,20 @@ final class CaptureViewModel: ObservableObject {
     )
 
     if reading.isAligned {
-      statusMessage =
-        stableHoldProgress < 1
-        ? "Hold on point"
-        : "Capturing"
+      if autoFireCapture {
+        statusMessage =
+          stableHoldProgress < 1
+          ? "Hold on point"
+          : "Capturing"
+      } else {
+        statusMessage = "Aligned · Tap shutter to capture"
+      }
     } else {
       statusMessage =
         "Align center to a point · \(capturedFrames.count) of \(totalFrameCount)"
     }
 
-    guard reading.isAligned, holdUpdate.shouldCapture else { return }
+    guard autoFireCapture, reading.isAligned, holdUpdate.shouldCapture else { return }
     isCapturingPhoto = true
     Task {
       await capture(target: nearest.target, reference: captureReference)
@@ -580,7 +819,11 @@ final class CaptureViewModel: ObservableObject {
       )
 
       capturedFrames.append(record)
-      try await camera.lockExposureFocusWhiteBalance()
+      if cameraMode == .auto {
+        try await camera.lockExposureFocusWhiteBalance()
+      } else {
+        await applyManualControls()
+      }
       UINotificationFeedbackGenerator().notificationOccurred(.success)
       alignmentHoldTracker.reset()
       stableHoldProgress = 0

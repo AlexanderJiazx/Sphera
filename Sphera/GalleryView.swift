@@ -107,7 +107,6 @@ struct GalleryView: View {
         package: package,
         onShare: { await presentShare(for: package) }
       )
-      .navigationTransition(.zoom(sourceID: package.manifest.sessionID, in: galleryZoom))
     } else {
       GalleryDetailView(
         model: model,
@@ -388,7 +387,7 @@ struct GalleryDetailView: View {
           .font(.caption)
           .foregroundStyle(.secondary)
           Text(
-            "Pose + gyro recorded · alignment \(frame.alignment.directionErrorDegrees, format: .number.precision(.fractionLength(2)))°"
+            "Alignment error \(frame.alignment.directionErrorDegrees, format: .number.precision(.fractionLength(2)))°"
           )
           .font(.caption2)
           .foregroundStyle(.secondary)

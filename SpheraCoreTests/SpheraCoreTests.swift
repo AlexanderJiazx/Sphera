@@ -948,3 +948,85 @@ func defaultStitchPathLoadsNoMLModels() {
       == "sensor_first_s1_adaptive_ring_seam_polar_cube"
   )
 }
+
+@Test("Downward pitch pointing to upward target produces upward screen guidance without inversion")
+func downwardPitchPointingToUpwardTargetGuidesUpward() {
+  let reference = makePortraitCaptureReference()
+  // Downward pitch target (pitch = -55 degrees)
+  let downwardTarget = CaptureTarget(
+    id: "downward-0",
+    sequenceIndex: 8,
+    ring: .downward,
+    ringIndex: 0,
+    ringCount: 5,
+    yawDegrees: 0,
+    pitchDegrees: -55,
+    rollDegrees: 0
+  )
+  // Upward target (pitch = +55 degrees)
+  let upwardTarget = CaptureTarget(
+    id: "upward-0",
+    sequenceIndex: 13,
+    ring: .upward,
+    ringIndex: 0,
+    ringCount: 5,
+    yawDegrees: 0,
+    pitchDegrees: 55,
+    rollDegrees: 0
+  )
+
+  // Camera pointing at downward target
+  let downwardCameraSample = makeMotionSample(
+    cameraToCaptureReference: OrientationMath.targetCameraToCaptureReference(downwardTarget),
+    captureReference: reference
+  )
+
+  let projection = OrientationMath.projectTargetToScreen(
+    sample: downwardCameraSample,
+    captureReference: reference,
+    target: upwardTarget
+  )
+
+  // The upward target is above the downward optical axis in camera space.
+  // In camera coordinates (+x right, +y down), aiming angle must point UP (-y, angle ~ -pi/2).
+  // It must NOT point down (+y, angle ~ +pi/2) as occurred when divided by negative forward z.
+  #expect(projection.aimingAngleRadians < 0)
+  #expect(abs(projection.aimingAngleRadians - (-Double.pi / 2)) < 0.2)
+}
+
+@Test("Continuous angle unwrapping follows the shortest path across boundary")
+func continuousAngleUnwrappingFollowsShortestPath() {
+  func shortestDelta(from current: Double, to target: Double) -> Double {
+    var delta = (target - current).truncatingRemainder(dividingBy: 2 * .pi)
+    if delta > .pi { delta -= 2 * .pi }
+    if delta < -.pi { delta += 2 * .pi }
+    return delta
+  }
+
+  // Jumping from +179 degrees (+3.124 rad) to -179 degrees (-3.124 rad)
+  let currentAngle = 179.0 * .pi / 180.0
+  let targetAngle = -179.0 * .pi / 180.0
+  let delta = shortestDelta(from: currentAngle, to: targetAngle)
+  // Shortest delta is +2 degrees (+0.035 rad), NOT -358 degrees!
+  #expect(abs(delta - (2.0 * .pi / 180.0)) < 1e-6)
+
+  var unwrapped = currentAngle
+  unwrapped += delta
+  #expect(abs(unwrapped - (181.0 * .pi / 180.0)) < 1e-6)
+}
+
+@Test("CaptureConfiguration encodes and decodes with tolerance and preset values")
+func captureConfigurationPersistence() throws {
+  var config = CaptureConfiguration.debugPreset
+  config.alignmentToleranceDegrees = 8.0
+  config.horizontalCount = 10
+
+  let data = try JSONEncoder().encode(config)
+  let decoded = try JSONDecoder().decode(CaptureConfiguration.self, from: data)
+  #expect(decoded.alignmentToleranceDegrees == 8.0)
+  #expect(decoded.horizontalCount == 10)
+  #expect(decoded.downwardCount == 5)
+  #expect(decoded.upwardCount == 5)
+}
+
+

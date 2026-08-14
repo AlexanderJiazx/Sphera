@@ -41,14 +41,24 @@ struct PanoramaViewer: UIViewRepresentable {
       target: context.coordinator,
       action: #selector(Coordinator.pan(_:))
     )
-    pan.maximumNumberOfTouches = 1
+    pan.minimumNumberOfTouches = 1
+    pan.maximumNumberOfTouches = 2
+    pan.delegate = context.coordinator
     view.addGestureRecognizer(pan)
 
     let pinch = UIPinchGestureRecognizer(
       target: context.coordinator,
       action: #selector(Coordinator.pinch(_:))
     )
+    pinch.delegate = context.coordinator
     view.addGestureRecognizer(pinch)
+
+    let rotation = UIRotationGestureRecognizer(
+      target: context.coordinator,
+      action: #selector(Coordinator.rotate(_:))
+    )
+    rotation.delegate = context.coordinator
+    view.addGestureRecognizer(rotation)
 
     context.coordinator.installPanorama(from: imageURL, in: view)
     context.coordinator.startDeviceMotion()
@@ -65,7 +75,7 @@ struct PanoramaViewer: UIViewRepresentable {
     coordinator.stopDeviceMotion()
   }
 
-  final class Coordinator: NSObject {
+  final class Coordinator: NSObject, UIGestureRecognizerDelegate {
     fileprivate weak var cameraNode: SCNNode?
     fileprivate weak var sceneView: SCNView?
     fileprivate var loadedURL: URL?
@@ -74,11 +84,7 @@ struct PanoramaViewer: UIViewRepresentable {
     private let motionManager = CMMotionManager()
     /// Latest absolute CM attitude quaternion (device → reference frame).
     private var latestMotionQuaternion: simd_quatf?
-    private var touchYawOffset: Float = 0
-    private var touchPitchOffset: Float = 0
-    private var gestureStartYawOffset: Float = 0
-    private var gestureStartPitchOffset: Float = 0
-    private var gestureStartFieldOfView: CGFloat = 72
+    private var sphereOrientation: simd_quatf = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
     private weak var panoramaNode: SCNNode?
 
     /// CoreMotion reference is Z-up; SceneKit is Y-up with the camera looking
@@ -114,6 +120,7 @@ struct PanoramaViewer: UIViewRepresentable {
       sphere.materials = [material]
 
       let node = SCNNode(geometry: sphere)
+      node.simdOrientation = sphereOrientation
       view.scene?.rootNode.addChildNode(node)
       panoramaNode = node
       loadedURL = url
@@ -125,9 +132,6 @@ struct PanoramaViewer: UIViewRepresentable {
       guard !motionManager.isDeviceMotionActive else { return }
 
       latestMotionQuaternion = nil
-      // xArbitraryZVertical: Z = gravity up, X locked when updates start.
-      // Starting updates when the viewer opens makes "forward" match the
-      // phone pose at open without multiplyByInverseOf + Euler hacks.
       motionManager.deviceMotionUpdateInterval = 1.0 / 60.0
       motionManager.startDeviceMotionUpdates(using: .xArbitraryZVertical, to: .main) {
         [weak self] motion, _ in
@@ -150,60 +154,72 @@ struct PanoramaViewer: UIViewRepresentable {
 
     @objc fileprivate func pan(_ recognizer: UIPanGestureRecognizer) {
       guard let view = recognizer.view else { return }
-      switch recognizer.state {
-      case .began:
-        gestureStartYawOffset = touchYawOffset
-        gestureStartPitchOffset = touchPitchOffset
-      case .changed:
+      if recognizer.state == .changed {
         let translation = recognizer.translation(in: view)
+        recognizer.setTranslation(.zero, in: view)
         let width = max(view.bounds.width, 1)
         let height = max(view.bounds.height, 1)
         // Grab-the-sphere drag (reversed from look-drag).
-        touchYawOffset =
-          gestureStartYawOffset + Float(translation.x / width) * .pi
-        touchPitchOffset =
-          gestureStartPitchOffset + Float(translation.y / height) * (.pi / 2)
-        applyCameraOrientation(motionQuaternion: latestMotionQuaternion)
+        let deltaYaw = -Float(translation.x / width) * .pi
+        let deltaPitch = -Float(translation.y / height) * (.pi / 2)
+        applyTouchDelta(yaw: deltaYaw, pitch: deltaPitch, roll: 0)
         (view as? SCNView)?.setNeedsDisplay()
-      default:
-        break
+      }
+    }
+
+    @objc fileprivate func rotate(_ recognizer: UIRotationGestureRecognizer) {
+      guard let view = recognizer.view else { return }
+      if recognizer.state == .changed {
+        let deltaRotation = Float(recognizer.rotation)
+        recognizer.rotation = 0
+        applyTouchDelta(yaw: 0, pitch: 0, roll: -deltaRotation)
+        (view as? SCNView)?.setNeedsDisplay()
       }
     }
 
     @objc fileprivate func pinch(_ recognizer: UIPinchGestureRecognizer) {
-      switch recognizer.state {
-      case .began:
-        gestureStartFieldOfView = fieldOfView
-      case .changed:
-        fieldOfView = min(100, max(38, gestureStartFieldOfView / recognizer.scale))
+      if recognizer.state == .changed {
+        let scale = recognizer.scale
+        recognizer.scale = 1.0
+        fieldOfView = min(100, max(38, fieldOfView / scale))
         cameraNode?.camera?.fieldOfView = fieldOfView
         (recognizer.view as? SCNView)?.setNeedsDisplay()
-      default:
-        break
       }
     }
 
-    /// Compose SceneKit camera orientation from the full CM quaternion.
-    ///
-    /// Order matches CTPanoramaView spherical + both-controls mode:
-    /// `yaw_world * (Rx(-π/2) * q_cm) * pitch_local`, plus capture heading align.
+    func gestureRecognizer(
+      _ gestureRecognizer: UIGestureRecognizer,
+      shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
+    ) -> Bool {
+      guard let view = sceneView else { return false }
+      return otherGestureRecognizer.view == view
+    }
+
+    private func applyTouchDelta(yaw: Float, pitch: Float, roll: Float) {
+      guard let cameraNode else { return }
+      let qYaw = simd_quatf(angle: yaw, axis: SIMD3<Float>(0, 1, 0))
+      let qPitch = simd_quatf(angle: pitch, axis: SIMD3<Float>(1, 0, 0))
+      let qRoll = simd_quatf(angle: roll, axis: SIMD3<Float>(0, 0, 1))
+      let qDeltaCam = qYaw * qPitch * qRoll
+
+      let camOrient = cameraNode.simdOrientation
+      let qDeltaWorld = camOrient * qDeltaCam * camOrient.inverse
+
+      sphereOrientation = simd_normalize(qDeltaWorld * sphereOrientation)
+
+      SCNTransaction.begin()
+      SCNTransaction.disableActions = true
+      panoramaNode?.simdOrientation = sphereOrientation
+      SCNTransaction.commit()
+    }
+
+    /// Compose SceneKit camera orientation purely from the full CM quaternion.
     fileprivate func applyCameraOrientation(motionQuaternion: simd_quatf?) {
       guard let cameraNode else { return }
 
       var orientation = motionQuaternion ?? simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
       orientation = coreMotionToSceneKit * orientation
       orientation = captureHeadingAlign * orientation
-
-      let yawTouch = simd_quatf(
-        angle: touchYawOffset,
-        axis: SIMD3<Float>(0, 1, 0)
-      )
-      let pitchTouch = simd_quatf(
-        angle: touchPitchOffset,
-        axis: SIMD3<Float>(1, 0, 0)
-      )
-      // World-Y yaw on the left, camera-local-X pitch on the right.
-      orientation = yawTouch * orientation * pitchTouch
 
       SCNTransaction.begin()
       SCNTransaction.disableActions = true
