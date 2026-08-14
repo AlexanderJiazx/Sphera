@@ -42,7 +42,19 @@ final class CaptureViewModel: ObservableObject {
   let camera: CameraCaptureService
 
   private let packageStore: CapturePackageStore
-  private let stitcher: any PanoramaStitching
+  /// When set (tests), compute always uses this stitcher and ignores the toggle.
+  private let stitcherOverride: (any PanoramaStitching)?
+  private static let experimentalMetalStitchKey = "useExperimentalMetalStitch"
+  /// Settings toggle, off by default. Does not change the stable OpenCV path
+  /// unless the user turns this on.
+  @Published var useExperimentalMetalStitch: Bool {
+    didSet {
+      UserDefaults.standard.set(
+        useExperimentalMetalStitch,
+        forKey: Self.experimentalMetalStitchKey
+      )
+    }
+  }
   private var subscriptions = Set<AnyCancellable>()
   private var captureReference: CaptureReferenceFrame?
   private var alignmentHoldTracker = AlignmentHoldTracker()
@@ -54,21 +66,34 @@ final class CaptureViewModel: ObservableObject {
 
   init(
     packageStore: CapturePackageStore = CapturePackageStore(),
-    stitcher: any PanoramaStitching = SpheraEngineAdapter(
-      nativeEngine: OpenCVSpheraEngine()
-    )
+    stitcher: (any PanoramaStitching)? = nil
   ) {
     let motion = MotionTrackingService()
     self.motion = motion
     camera = CameraCaptureService(motionStore: motion.sampleStore)
     self.packageStore = packageStore
-    self.stitcher = stitcher
+    self.stitcherOverride = stitcher
+    useExperimentalMetalStitch = UserDefaults.standard.bool(
+      forKey: Self.experimentalMetalStitchKey
+    )
 
     motion.$currentSample
       .sink { [weak self] sample in
         self?.handleMotionSample(sample)
       }
       .store(in: &subscriptions)
+  }
+
+  /// Default remains the stable OpenCV engine. The experimental Metal engine
+  /// is selected only when the Settings toggle is on and no test override is set.
+  private func activeStitcher() -> any PanoramaStitching {
+    if let stitcherOverride {
+      return stitcherOverride
+    }
+    if useExperimentalMetalStitch {
+      return SpheraEngineAdapter(nativeEngine: ExperimentalSpheraEngine())
+    }
+    return SpheraEngineAdapter(nativeEngine: OpenCVSpheraEngine())
   }
 
   var totalFrameCount: Int { plan.targets.count }
@@ -226,9 +251,15 @@ final class CaptureViewModel: ObservableObject {
   func computeOnDevice(package: CapturePackage, replaceExisting: Bool = false) async {
     phase = .stitching
     stitchProgress = nil
+    let usingExperimental =
+      stitcherOverride == nil && useExperimentalMetalStitch
     statusMessage = replaceExisting
-      ? "Recomputing panorama on device"
-      : "Starting native stitch"
+      ? (usingExperimental
+        ? "Recomputing with experimental Metal stitch"
+        : "Recomputing panorama on device")
+      : (usingExperimental
+        ? "Starting experimental Metal stitch"
+        : "Starting native stitch")
     camera.stop()
     motion.stop()
 
@@ -236,6 +267,7 @@ final class CaptureViewModel: ObservableObject {
       if replaceExisting {
         try await packageStore.clearEngineOutput(for: package)
       }
+      let stitcher = activeStitcher()
       let result = try await stitcher.stitch(package: package) { [weak self] update in
         Task { @MainActor in
           guard let self else { return }

@@ -14,6 +14,7 @@ let package = Package(
       path: "Sphera",
       exclude: [
         "EngineBridge",
+        "ExperimentalSpheraEngine.swift",
         "Resources",
         "CameraCaptureService.swift",
         "CameraPreviewView.swift",

@@ -11,3 +11,7 @@ outputs/
 # NativeTests Makefile products
 NativeTests/test_sensor_first
 NativeTests/run_native_stitch
+NativeTests/test_experimental
+NativeTests/run_experimental_stitch
+NativeTests/run_experimental_metal
+NativeTests/.build-exp-metal/

@@ -1,0 +1,14 @@
+{
+  "originHash" : "4cd4981f4fcc3fd1951a2df452337fe592d422b3acbc7c1df153d4781f6a9fea",
+  "pins" : [
+    {
+      "identity" : "swift-jpeg",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/tayloraswift/swift-jpeg.git",
+      "state" : {
+        "revision" : "f00ea9305da59f151377d50b368c3d8a6da962d8"
+      }
+    }
+  ],
+  "version" : 3
+}

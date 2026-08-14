@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		000000000000000000000032 /* OpenCV/opencv2.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 000000000000000000000031 /* OpenCV/opencv2.framework */; platformFilters = (iphoneos, ); };
+		000000000000000000000200 /* SpheraMetalEngine in Frameworks */ = {isa = PBXBuildFile; productRef = 000000000000000000000201 /* SpheraMetalEngine */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -28,6 +29,7 @@
 			isa = PBXFrameworksBuildPhase;
 			files = (
 				000000000000000000000032 /* OpenCV/opencv2.framework in Frameworks */,
+				000000000000000000000200 /* SpheraMetalEngine in Frameworks */,
 			);
 		};
 /* End PBXFrameworksBuildPhase section */
@@ -75,6 +77,9 @@
 				000000000000000000000010 /* Sphera */,
 			);
 			name = Sphera;
+			packageProductDependencies = (
+				000000000000000000000201 /* SpheraMetalEngine */,
+			);
 			productName = MyApp;
 			productReference = 000000000000000000000120 /* Sphera.app */;
 			productType = "com.apple.product-type.application";
@@ -103,6 +108,9 @@
 			);
 			mainGroup = 000000000000000000000001;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				000000000000000000000202 /* XCLocalSwiftPackageReference "../Engine" */,
+			);
 			preferredProjectObjectVersion = 90;
 			productRefGroup = 000000000000000000000020 /* Products */;
 			projectDirPath = "";
@@ -174,7 +182,7 @@
 				GCC_C_LANGUAGE_STANDARD = gnu17;
 				GCC_DYNAMIC_NO_PIC = NO;
 				GCC_NO_COMMON_BLOCKS = YES;
-				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_OPTIMIZATION_LEVEL = s;
 				GCC_PREPROCESSOR_DEFINITIONS = (
 					"DEBUG=1",
 					"$(inherited)",
@@ -194,7 +202,8 @@
 				PROJECT_UNIQUE_VALUE = ZN0EG47J;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
-				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
 				WATCHOS_DEPLOYMENT_TARGET = 27.0;
 				XROS_DEPLOYMENT_TARGET = 27.0;
 			};
@@ -269,6 +278,16 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = C5857X34L7;
 				ENABLE_PREVIEWS = YES;
+				"EXCLUDED_SOURCE_FILE_NAMES[sdk=iphoneos*]" = SpheraNativeEngineSimulatorStub.mm;
+				"EXCLUDED_SOURCE_FILE_NAMES[sdk=iphonesimulator*]" = (
+					SpheraPanoramaEngine.cpp,
+					SpheraEngineMath.cpp,
+					SpheraPoseOverlap.cpp,
+					SpheraRotationRefinement.cpp,
+					SpheraAdaptiveRingSeam.cpp,
+					SpheraDirectSphere.cpp,
+					SpheraNativeEngine.mm,
+				);
 				FRAMEWORK_SEARCH_PATHS = "$(PROJECT_DIR)/Vendor/OpenCV";
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_NSCameraUsageDescription = "Sphera uses the ultra-wide camera to capture panorama source images.";
@@ -298,6 +317,10 @@
 					CoreVideo,
 					"-framework",
 					QuartzCore,
+					"-framework",
+					Metal,
+					"-framework",
+					ImageIO,
 					"-lc++",
 					"-lz",
 				);
@@ -315,24 +338,14 @@
 				SUPPORTS_MACCATALYST = NO;
 				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_COMPILATION_MODE = wholemodule;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_OBJC_BRIDGING_HEADER = "Sphera/Sphera-Bridging-Header.h";
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
 				SWIFT_STRICT_CONCURRENCY = targeted;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = 1;
-				"EXCLUDED_SOURCE_FILE_NAMES[sdk=iphonesimulator*]" = (
-					"SpheraPanoramaEngine.cpp",
-					"SpheraEngineMath.cpp",
-					"SpheraPoseOverlap.cpp",
-					"SpheraRotationRefinement.cpp",
-					"SpheraAdaptiveRingSeam.cpp",
-					"SpheraDirectSphere.cpp",
-					"SpheraNativeEngine.mm",
-				);
-				"EXCLUDED_SOURCE_FILE_NAMES[sdk=iphoneos*]" = (
-					"SpheraNativeEngineSimulatorStub.mm",
-				);
 			};
 			name = Debug;
 		};
@@ -343,6 +356,16 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = C5857X34L7;
 				ENABLE_PREVIEWS = YES;
+				"EXCLUDED_SOURCE_FILE_NAMES[sdk=iphoneos*]" = SpheraNativeEngineSimulatorStub.mm;
+				"EXCLUDED_SOURCE_FILE_NAMES[sdk=iphonesimulator*]" = (
+					SpheraPanoramaEngine.cpp,
+					SpheraEngineMath.cpp,
+					SpheraPoseOverlap.cpp,
+					SpheraRotationRefinement.cpp,
+					SpheraAdaptiveRingSeam.cpp,
+					SpheraDirectSphere.cpp,
+					SpheraNativeEngine.mm,
+				);
 				FRAMEWORK_SEARCH_PATHS = "$(PROJECT_DIR)/Vendor/OpenCV";
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_NSCameraUsageDescription = "Sphera uses the ultra-wide camera to capture panorama source images.";
@@ -372,6 +395,10 @@
 					CoreVideo,
 					"-framework",
 					QuartzCore,
+					"-framework",
+					Metal,
+					"-framework",
+					ImageIO,
 					"-lc++",
 					"-lz",
 				);
@@ -389,24 +416,14 @@
 				SUPPORTS_MACCATALYST = NO;
 				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_COMPILATION_MODE = wholemodule;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_OBJC_BRIDGING_HEADER = "Sphera/Sphera-Bridging-Header.h";
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
 				SWIFT_STRICT_CONCURRENCY = targeted;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = 1;
-				"EXCLUDED_SOURCE_FILE_NAMES[sdk=iphonesimulator*]" = (
-					"SpheraPanoramaEngine.cpp",
-					"SpheraEngineMath.cpp",
-					"SpheraPoseOverlap.cpp",
-					"SpheraRotationRefinement.cpp",
-					"SpheraAdaptiveRingSeam.cpp",
-					"SpheraDirectSphere.cpp",
-					"SpheraNativeEngine.mm",
-				);
-				"EXCLUDED_SOURCE_FILE_NAMES[sdk=iphoneos*]" = (
-					"SpheraNativeEngineSimulatorStub.mm",
-				);
 			};
 			name = Release;
 		};
@@ -430,6 +447,21 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		000000000000000000000202 /* XCLocalSwiftPackageReference "../Engine" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = ../Engine;
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		000000000000000000000201 /* SpheraMetalEngine */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 000000000000000000000202 /* XCLocalSwiftPackageReference "../Engine" */;
+			productName = SpheraMetalEngine;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 000000000000000000000000 /* Project object */;
 }

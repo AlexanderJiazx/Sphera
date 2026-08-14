@@ -131,6 +131,14 @@ private struct SettingsView: View {
       } footer: {
         Text("Changes apply the next time a capture session starts.")
       }
+
+      Section {
+        Toggle("Experimental Metal stitch", isOn: $model.useExperimentalMetalStitch)
+      } header: {
+        Text("On-device compute")
+      } footer: {
+        Text("Off by default. When off, Compute on device uses the stable OpenCV engine. When on, it uses the experimental Swift/Metal engine (no OpenCV).")
+      }
     }
     .navigationTitle("Settings")
     .onChange(of: model.configuration) {
