@@ -1,7 +1,8 @@
 import Foundation
 import SpheraMetalEngine
 
-/// Experimental Swift/Metal stitch. Selected only when the Settings toggle is on.
+/// Experimental 3-second Swift/Metal stitch from the sibling Engine package.
+/// Selected only when the Settings toggle is on.
 /// Default Compute on device still uses the stable OpenCV engine.
 final class ExperimentalSpheraEngine: NativeSpheraEngine, @unchecked Sendable {
   /// Dedicated GCD queue. `SpheraMetalStitch.run` blocks on Metal
@@ -16,8 +17,10 @@ final class ExperimentalSpheraEngine: NativeSpheraEngine, @unchecked Sendable {
     _ request: SpheraEngineRequest,
     progress: StitchProgressHandler?
   ) async throws -> StitchingResult {
-    report(progress, fraction: 0, message: "Starting experimental Metal stitch")
-    NSLog("Sphera experimental Metal stitch: Run scheme must be Release so SIFT is -O, not -Onone")
+    report(progress, fraction: 0, message: "Starting experimental 3s Metal stitch")
+    NSLog(
+      "Sphera experimental Metal stitch: Run scheme must be Release so SIFT is -O, not -Onone"
+    )
     await Task.yield()
 
     let captureURL = request.packageDirectoryURL
@@ -36,10 +39,15 @@ final class ExperimentalSpheraEngine: NativeSpheraEngine, @unchecked Sendable {
               )
             )
           }
+          NSLog(
+            "Sphera experimental Metal stitch finished in %.3f s",
+            result.elapsedSeconds
+          )
           continuation.resume(
             returning: StitchingResult(
               panoramaURL: result.panoramaURL,
-              reportURL: result.reportURL
+              reportURL: result.reportURL,
+              elapsedSeconds: result.elapsedSeconds
             )
           )
         } catch {

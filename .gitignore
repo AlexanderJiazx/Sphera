@@ -15,3 +15,4 @@ NativeTests/test_experimental
 NativeTests/run_experimental_stitch
 NativeTests/run_experimental_metal
 NativeTests/.build-exp-metal/
+NativeTests/outputs/

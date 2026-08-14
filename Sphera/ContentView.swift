@@ -137,7 +137,7 @@ private struct SettingsView: View {
       } header: {
         Text("On-device compute")
       } footer: {
-        Text("Off by default. When off, Compute on device uses the stable OpenCV engine. When on, it uses the experimental Swift/Metal engine (no OpenCV).")
+        Text("Off by default. When off, Compute on device uses the stable OpenCV engine. When on, it uses the experimental 3-second Swift/Metal engine (no OpenCV).")
       }
     }
     .navigationTitle("Settings")

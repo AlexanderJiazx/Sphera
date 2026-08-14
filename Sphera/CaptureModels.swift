@@ -375,4 +375,12 @@ struct CapturePackage: Equatable, Sendable {
 struct StitchingResult: Equatable, Sendable {
   let panoramaURL: URL
   let reportURL: URL?
+  /// Algorithm runtime from the experimental Swift/Metal engine, when known.
+  let elapsedSeconds: Double?
+
+  init(panoramaURL: URL, reportURL: URL?, elapsedSeconds: Double? = nil) {
+    self.panoramaURL = panoramaURL
+    self.reportURL = reportURL
+    self.elapsedSeconds = elapsedSeconds
+  }
 }

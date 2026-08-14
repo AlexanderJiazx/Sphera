@@ -84,8 +84,9 @@ final class CaptureViewModel: ObservableObject {
       .store(in: &subscriptions)
   }
 
-  /// Default remains the stable OpenCV engine. The experimental Metal engine
-  /// is selected only when the Settings toggle is on and no test override is set.
+  /// Default remains the stable OpenCV engine. The experimental 3-second
+  /// Swift/Metal engine is selected only when the Settings toggle is on and
+  /// no test override is set.
   private func activeStitcher() -> any PanoramaStitching {
     if let stitcherOverride {
       return stitcherOverride
@@ -255,10 +256,10 @@ final class CaptureViewModel: ObservableObject {
       stitcherOverride == nil && useExperimentalMetalStitch
     statusMessage = replaceExisting
       ? (usingExperimental
-        ? "Recomputing with experimental Metal stitch"
+        ? "Recomputing with experimental 3s Metal stitch"
         : "Recomputing panorama on device")
       : (usingExperimental
-        ? "Starting experimental Metal stitch"
+        ? "Starting experimental 3s Metal stitch"
         : "Starting native stitch")
     camera.stop()
     motion.stop()
@@ -284,7 +285,14 @@ final class CaptureViewModel: ObservableObject {
           stitchingMessage: nil
         )
       )
-      statusMessage = "Panorama complete"
+      if usingExperimental, let elapsed = result.elapsedSeconds {
+        statusMessage = String(
+          format: "Experimental Metal stitch complete in %.2fs",
+          elapsed
+        )
+      } else {
+        statusMessage = "Panorama complete"
+      }
       await refreshGallery()
     } catch {
       stitchProgress = nil
