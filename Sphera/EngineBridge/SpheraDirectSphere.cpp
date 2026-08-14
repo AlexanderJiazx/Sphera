@@ -5,6 +5,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <stdexcept>
 #include <vector>
@@ -19,6 +22,7 @@
 #pragma clang diagnostic ignored "-Wdocumentation-deprecated-sync"
 #pragma clang diagnostic ignored "-Wquoted-include-in-framework-header"
 #include <opencv2/imgproc.hpp>
+#include <opencv2/imgcodecs.hpp>
 #include <opencv2/stitching/detail/blenders.hpp>
 #include <opencv2/stitching/detail/exposure_compensate.hpp>
 #include <opencv2/stitching/detail/seam_finders.hpp>
@@ -644,6 +648,47 @@ PairwiseResponseFieldEstimate equalizePairwiseResponseFields(
     logCenters.push_back(medianOfDoubles(std::move(validLogs)));
   }
 
+  const char *responseDebugValue =
+      std::getenv("SPHERA_DEBUG_NATIVE_RESPONSE_DIR");
+  if (responseDebugValue != nullptr) {
+    const std::filesystem::path responseDebug(responseDebugValue);
+    std::filesystem::create_directories(responseDebug);
+    const auto writeMat = [&](const cv::Mat &value,
+                              const std::string &name) {
+      std::ofstream stream(responseDebug / name, std::ios::binary);
+      if (value.isContinuous()) {
+        stream.write(reinterpret_cast<const char *>(value.ptr()),
+                     static_cast<std::streamsize>(value.total() *
+                                                  value.elemSize()));
+      } else {
+        for (int row = 0; row < value.rows; ++row) {
+          stream.write(reinterpret_cast<const char *>(value.ptr(row)),
+                       static_cast<std::streamsize>(value.cols *
+                                                    value.elemSize()));
+        }
+      }
+    };
+    for (int index = 0; index < imageCount; ++index) {
+      writeMat(lumas[static_cast<std::size_t>(index)],
+               "luma_" + std::to_string(index) + ".f32");
+      writeMat(logs[static_cast<std::size_t>(index)],
+               "log_" + std::to_string(index) + ".f32");
+      writeMat(textures[static_cast<std::size_t>(index)],
+               "texture_" + std::to_string(index) + ".f32");
+      writeMat(interiors[static_cast<std::size_t>(index)],
+               "interior_" + std::to_string(index) + ".u8");
+      writeMat(normalizedSourceX[static_cast<std::size_t>(index)],
+               "normalized_x_" + std::to_string(index) + ".f32");
+      writeMat(normalizedSourceY[static_cast<std::size_t>(index)],
+               "normalized_y_" + std::to_string(index) + ".f32");
+    }
+    std::ofstream centerStream(responseDebug / "log_centers.f64",
+                               std::ios::binary);
+    centerStream.write(reinterpret_cast<const char *>(logCenters.data()),
+                       static_cast<std::streamsize>(logCenters.size() *
+                                                    sizeof(double)));
+  }
+
   const auto usableAt = [&](int first, int second, int row, int column) {
     if (interiors[static_cast<std::size_t>(first)].at<uchar>(row, column) == 0 ||
         interiors[static_cast<std::size_t>(second)].at<uchar>(row, column) == 0) {
@@ -772,6 +817,20 @@ PairwiseResponseFieldEstimate equalizePairwiseResponseFields(
   totalSamples = static_cast<int>(samples.size());
   estimate.equationCount = totalSamples;
   estimate.pairCount = static_cast<int>(plans.size());
+  if (responseDebugValue != nullptr) {
+    const std::filesystem::path responseDebug(responseDebugValue);
+    std::ofstream sampleStream(responseDebug / "samples.bin",
+                               std::ios::binary);
+    sampleStream.write(reinterpret_cast<const char *>(samples.data()),
+                       static_cast<std::streamsize>(samples.size() *
+                                                    sizeof(ResponseSample)));
+    std::ofstream planStream(responseDebug / "plans.i32", std::ios::binary);
+    for (const ResponsePairPlan &plan : plans) {
+      const int values[] = {plan.first, plan.second, plan.reliablePixels,
+                            plan.sampleStep, plan.sampleCount};
+      planStream.write(reinterpret_cast<const char *>(values), sizeof(values));
+    }
+  }
   considerPeakMegabytes(estimate.peakMegabytes);
 
   std::vector<double> robustWeights(static_cast<std::size_t>(totalSamples), 1.0);
@@ -835,6 +894,45 @@ PairwiseResponseFieldEstimate equalizePairwiseResponseFields(
         (cv::getTickCount() - started) / cv::getTickFrequency();
     considerPeakMegabytes(estimate.peakMegabytes);
     return estimate;
+  }
+
+  if (responseDebugValue != nullptr) {
+    const std::filesystem::path responseDebug(responseDebugValue);
+    std::ofstream coefficientStream(responseDebug / "coefficients.f64",
+                                    std::ios::binary);
+    coefficientStream.write(
+        reinterpret_cast<const char *>(coefficients.ptr<double>()),
+        static_cast<std::streamsize>(parameterCount * sizeof(double)));
+    std::ofstream weightStream(responseDebug / "robust_weights.f64",
+                               std::ios::binary);
+    weightStream.write(reinterpret_cast<const char *>(robustWeights.data()),
+                       static_cast<std::streamsize>(robustWeights.size() *
+                                                    sizeof(double)));
+    std::vector<double> finalNormal;
+    std::vector<double> finalRhs;
+    double finalWeightSum = 0.0;
+    {
+      cv::Mat normal;
+      cv::Mat rhs;
+      accumulateWeightedNormalEquations(samples, robustWeights, imageCount,
+                                        normal, rhs, finalWeightSum);
+      finalNormal.assign(normal.ptr<double>(),
+                         normal.ptr<double>() + parameterCount * parameterCount);
+      finalRhs.assign(rhs.ptr<double>(), rhs.ptr<double>() + parameterCount);
+    }
+    std::ofstream normalStream(responseDebug / "final_normal.f64",
+                               std::ios::binary);
+    normalStream.write(reinterpret_cast<const char *>(finalNormal.data()),
+                       static_cast<std::streamsize>(finalNormal.size() *
+                                                    sizeof(double)));
+    std::ofstream rhsStream(responseDebug / "final_rhs.f64", std::ios::binary);
+    rhsStream.write(reinterpret_cast<const char *>(finalRhs.data()),
+                    static_cast<std::streamsize>(finalRhs.size() *
+                                                 sizeof(double)));
+    std::ofstream weightSumStream(responseDebug / "final_weight_sum.f64",
+                                 std::ios::binary);
+    weightSumStream.write(reinterpret_cast<const char *>(&finalWeightSum),
+                          sizeof(finalWeightSum));
   }
 
   std::vector<double> absoluteBefore;
@@ -1176,6 +1274,24 @@ static PolarCubeFaceStats composePolarCubeFace(
       for (int column = 0; column < faceSize; ++column) {
         const float localX = static_cast<float>(
             (((column + 0.5) / faceSize) * 2.0 - 1.0) * extent);
+        if (std::getenv("SPHERA_DEBUG_NATIVE_POLAR_SCALARS") != nullptr &&
+            faceSize == 1024 && row == 0 &&
+            (column == 0 || column == 10 || column == 12 || column == 20)) {
+          const float squared = localX * localX + localY * localY + 1.0f;
+          const float root = std::sqrt(squared);
+          const float inverse = 1.0f / root;
+          const float debugWorldX = localX * inverse;
+          const float debugWorldZ = localY * inverse;
+          std::fprintf(stderr,
+                       "native polar scalar x=%d local=%08x y=%08x squared=%08x sqrt=%08x inverse=%08x worldx=%08x worldz=%08x\n",
+                       column, *reinterpret_cast<const unsigned *>(&localX),
+                       *reinterpret_cast<const unsigned *>(&localY),
+                       *reinterpret_cast<const unsigned *>(&squared),
+                       *reinterpret_cast<const unsigned *>(&root),
+                       *reinterpret_cast<const unsigned *>(&inverse),
+                       *reinterpret_cast<const unsigned *>(&debugWorldX),
+                       *reinterpret_cast<const unsigned *>(&debugWorldZ));
+        }
         const float inverseLength =
             1.0f / std::sqrt(localX * localX + localY * localY + 1.0f);
         // Top: local (x,y,z) -> world (x,-z,y).
@@ -1186,6 +1302,17 @@ static PolarCubeFaceStats composePolarCubeFace(
             : cv::Vec3f(localX * inverseLength, inverseLength,
                         -localY * inverseLength);
       }
+    }
+    if (const char *directoryValue =
+            std::getenv("SPHERA_DEBUG_NATIVE_POLAR_INTERMEDIATE")) {
+      const std::filesystem::path directory(directoryValue);
+      std::filesystem::create_directories(directory);
+      std::ofstream stream(
+          directory / ("world_" + std::to_string(faceSize) + ".f32"),
+          std::ios::binary);
+      stream.write(
+          reinterpret_cast<const char *>(world.data()),
+          static_cast<std::streamsize>(world.size() * sizeof(cv::Vec3f)));
     }
 
     for (int globalIndex : sourceIndices) {
@@ -1201,6 +1328,12 @@ static PolarCubeFaceStats composePolarCubeFace(
       cv::Mat mapX(faceSize, faceSize, CV_32F);
       cv::Mat mapY(faceSize, faceSize, CV_32F);
       cv::Mat valid(faceSize, faceSize, CV_8U, cv::Scalar(0));
+      const bool dumpIntermediate =
+          std::getenv("SPHERA_DEBUG_NATIVE_POLAR_INTERMEDIATE") != nullptr;
+      std::vector<cv::Vec3f> localDebug;
+      if (dumpIntermediate) {
+        localDebug.resize(static_cast<std::size_t>(faceSize * faceSize));
+      }
       for (int row = 0; row < faceSize; ++row) {
         float *mapXRow = mapX.ptr<float>(row);
         float *mapYRow = mapY.ptr<float>(row);
@@ -1208,6 +1341,9 @@ static PolarCubeFaceStats composePolarCubeFace(
         for (int column = 0; column < faceSize; ++column) {
           const cv::Vec3f local = rotationT *
               world[static_cast<std::size_t>(row * faceSize + column)];
+          if (dumpIntermediate) {
+            localDebug[static_cast<std::size_t>(row * faceSize + column)] = local;
+          }
           const float safeZ = std::abs(local[2]) > 1e-7f ? local[2] : 1.0f;
           const float sampleX = fx * local[0] / safeZ + cx;
           const float sampleY = fy * local[1] / safeZ + cy;
@@ -1219,6 +1355,17 @@ static PolarCubeFaceStats composePolarCubeFace(
             validRow[column] = 255;
           }
         }
+      }
+      if (dumpIntermediate) {
+        const std::filesystem::path directory(
+            std::getenv("SPHERA_DEBUG_NATIVE_POLAR_INTERMEDIATE"));
+        std::ofstream stream(
+            directory / ("local_" + std::to_string(faceSize) + "_source_" +
+                         std::to_string(globalIndex) + ".f32"),
+            std::ios::binary);
+        stream.write(
+            reinterpret_cast<const char *>(localDebug.data()),
+            static_cast<std::streamsize>(localDebug.size() * sizeof(cv::Vec3f)));
       }
       cv::Mat sampled;
       cv::remap(source, sampled, mapX, mapY, cv::INTER_LINEAR,
@@ -1236,16 +1383,46 @@ static PolarCubeFaceStats composePolarCubeFace(
       }
       images.push_back(std::move(sampled));
       masks.push_back(std::move(valid));
+      if (const char *mapDirectory = std::getenv("SPHERA_DEBUG_NATIVE_POLAR_MAPS")) {
+        const std::filesystem::path directory(mapDirectory);
+        std::filesystem::create_directories(directory);
+        const std::string prefix = "size_" + std::to_string(faceSize) + "_source_" + std::to_string(globalIndex);
+        std::ofstream xStream(directory / (prefix + "_x.f32"), std::ios::binary);
+        std::ofstream yStream(directory / (prefix + "_y.f32"), std::ios::binary);
+        xStream.write(reinterpret_cast<const char *>(mapX.ptr<float>()),
+                      static_cast<std::streamsize>(mapX.total() * sizeof(float)));
+        yStream.write(reinterpret_cast<const char *>(mapY.ptr<float>()),
+                      static_cast<std::streamsize>(mapY.total() * sizeof(float)));
+      }
     }
   };
 
   std::vector<cv::Mat> seamImages;
   std::vector<cv::Mat> seamMasks;
   renderLayers(seamSize, seamImages, seamMasks);
+  const char *debugPolarDirectory = std::getenv("SPHERA_DEBUG_NATIVE_POLAR");
+  const std::filesystem::path debugPolar =
+      debugPolarDirectory != nullptr ? std::filesystem::path(debugPolarDirectory)
+                                    : std::filesystem::path();
+  if (!debugPolar.empty() && topPole) {
+    std::filesystem::create_directories(debugPolar);
+    for (std::size_t index = 0; index < seamImages.size(); ++index) {
+      cv::imwrite((debugPolar / ("seam_image_" + std::to_string(index) + ".png")).string(), seamImages[index]);
+      cv::imwrite((debugPolar / ("seam_valid_" + std::to_string(index) + ".png")).string(), seamMasks[index]);
+    }
+  }
   std::vector<cv::UMat> seamProxiesU(seamImages.size());
   std::vector<cv::UMat> seamMasksU(seamMasks.size());
   for (std::size_t index = 0; index < seamImages.size(); ++index) {
     cv::Mat proxy = structureSeamProxy(seamImages[index]);
+    if (const char *directoryValue =
+            std::getenv("SPHERA_DEBUG_NATIVE_POLAR_PROXY")) {
+      const std::filesystem::path directory(directoryValue);
+      std::filesystem::create_directories(directory);
+      cv::imwrite(
+          (directory / ("proxy_" + std::to_string(index) + ".png")).string(),
+          proxy);
+    }
     proxy.convertTo(seamProxiesU[index], CV_32F);
     seamMasks[index].copyTo(seamMasksU[index]);
   }
@@ -1262,6 +1439,12 @@ static PolarCubeFaceStats composePolarCubeFace(
   }
   stats.graphCutSeconds =
       (cv::getTickCount() - graphCutStarted) / cv::getTickFrequency();
+  if (!debugPolar.empty() && topPole) {
+    for (std::size_t index = 0; index < seamMasksU.size(); ++index) {
+      cv::imwrite((debugPolar / ("seam_selected_" + std::to_string(index) + ".png")).string(),
+                  seamMasksU[index].getMat(cv::ACCESS_READ));
+    }
+  }
   const OwnerTopologyPruneStats topologyPrune =
       pruneLowTextureOwnerIslands(seamMasksU, seamMasks, seamImages);
   stats.topologyPrunedComponents = topologyPrune.removedComponents;
@@ -1295,10 +1478,23 @@ static PolarCubeFaceStats composePolarCubeFace(
   std::vector<cv::Mat> composeNormalizedSourceY;
   renderLayers(composeSize, composeImages, composeMasks,
                &composeNormalizedSourceX, &composeNormalizedSourceY);
+  if (!debugPolar.empty() && topPole) {
+    for (std::size_t index = 0; index < composeImages.size(); ++index) {
+      cv::imwrite(
+          (debugPolar / ("compose_raw_" + std::to_string(index) + ".png")).string(),
+          composeImages[index]);
+    }
+  }
   const PairwiseResponseFieldEstimate responseField =
       equalizePairwiseResponseFields(composeImages, composeMasks,
                                      composeNormalizedSourceX,
                                      composeNormalizedSourceY);
+  if (!debugPolar.empty() && topPole) {
+    for (std::size_t index = 0; index < composeImages.size(); ++index) {
+      cv::imwrite((debugPolar / ("compose_corrected_" + std::to_string(index) + ".png")).string(), composeImages[index]);
+      cv::imwrite((debugPolar / ("compose_valid_" + std::to_string(index) + ".png")).string(), composeMasks[index]);
+    }
+  }
   stats.responseFieldAccepted = responseField.accepted;
   stats.responseFieldEquationCount = responseField.equationCount;
   stats.responseFieldPairCount = responseField.pairCount;
@@ -1380,6 +1576,13 @@ static PolarCubeFaceStats composePolarCubeFace(
   cv::Mat face;
   face16.convertTo(face, CV_8U);
   face.setTo(cv::Scalar::all(0), faceMask == 0);
+  if (!debugPolar.empty() && topPole) {
+    cv::imwrite((debugPolar / "face.png").string(), face);
+    cv::imwrite((debugPolar / "face_mask.png").string(), faceMask);
+    std::ofstream ownerStream(debugPolar / "owner_face.s16", std::ios::binary);
+    ownerStream.write(reinterpret_cast<const char *>(ownerFace.ptr<short>()),
+                      static_cast<std::streamsize>(ownerFace.total() * sizeof(short)));
+  }
 
   const int transitionRows = std::min(
       panorama.rows,
@@ -1427,6 +1630,10 @@ static PolarCubeFaceStats composePolarCubeFace(
             cv::BORDER_CONSTANT, cv::Scalar(0));
   cv::remap(ownerFace, sampledOwner, mapX, mapY, cv::INTER_NEAREST,
             cv::BORDER_CONSTANT, cv::Scalar(-1));
+  if (!debugPolar.empty() && topPole) {
+    cv::imwrite((debugPolar / "sampled.png").string(), sampled);
+    cv::imwrite((debugPolar / "sampled_mask.png").string(), sampledMask);
+  }
 
   cv::Vec3d gains(1, 1, 1);
   for (int channel = 0; channel < 3; ++channel) {
@@ -1484,6 +1691,13 @@ static PolarCubeFaceStats composePolarCubeFace(
   stats.longitudeGainMaximum = longitudeGain.maximum;
   stats.longitudeGainP05 = longitudeGain.p05;
   stats.longitudeGainP95 = longitudeGain.p95;
+  if (!debugPolar.empty() && topPole) {
+    std::ofstream gainsStream(debugPolar / "photometric_gains.f64", std::ios::binary);
+    gainsStream.write(reinterpret_cast<const char *>(&gains[0]), 3 * sizeof(double));
+    std::ofstream longitudeStream(debugPolar / "longitude_gain.f32", std::ios::binary);
+    longitudeStream.write(reinterpret_cast<const char *>(longitudeGain.logGain.data()),
+                          static_cast<std::streamsize>(longitudeGain.logGain.size() * sizeof(float)));
+  }
 
   cv::Mat alpha(transitionRows, panorama.cols, CV_32F, cv::Scalar(0));
   for (int row = 0; row < transitionRows; ++row) {

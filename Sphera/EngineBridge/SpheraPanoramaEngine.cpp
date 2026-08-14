@@ -27,7 +27,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
+#include <iomanip>
 #include <sstream>
 #include <stdexcept>
 #include <sys/resource.h>
@@ -40,6 +42,18 @@
 #endif
 
 namespace sphera {
+class DebugSphericalWarper final : public cv::detail::SphericalWarper {
+public:
+  explicit DebugSphericalWarper(float scale)
+      : cv::detail::SphericalWarper(scale) {}
+  std::array<float, 10> projection(cv::InputArray K, cv::InputArray R) {
+    projector_.setCameraParams(K, R);
+    std::array<float, 10> result{};
+    std::copy(projector_.k_rinv, projector_.k_rinv + 9, result.begin());
+    result[9] = projector_.scale;
+    return result;
+  }
+};
 namespace {
 
 constexpr const char *kPipelineVersion =
@@ -410,6 +424,29 @@ StitchArtifacts PanoramaEngine::stitch(const StitchRequest &request) {
     frames[index].featureCount =
         static_cast<int>(features[index].keypoints.size());
   }
+  if (const char *siftDirEnv = std::getenv("SPHERA_DEBUG_NATIVE_SIFT_DIR")) {
+    const std::filesystem::path siftDir(siftDirEnv);
+    std::filesystem::create_directories(siftDir);
+    for (std::size_t index = 0; index < features.size(); ++index) {
+      std::fprintf(stderr, "native sift[%zu] keypoints=%zu work=%dx%d\n", index,
+                   features[index].keypoints.size(), workSizes[index].width,
+                   workSizes[index].height);
+      std::ofstream out(siftDir / ("keypoints_" + std::to_string(index) + ".txt"));
+      out.setf(std::ios::fmtflags(0), std::ios::floatfield);
+      out << std::setprecision(9);
+      for (const auto &kp : features[index].keypoints) {
+        out << kp.pt.x << ' ' << kp.pt.y << ' ' << kp.size << ' ' << kp.angle
+            << ' ' << kp.response << ' ' << kp.octave << '\n';
+      }
+      if (index == 6 || index == 15) {
+        cv::Mat descriptors = features[index].descriptors.getMat(cv::ACCESS_READ);
+        std::ofstream bin(siftDir / ("descriptors_" + std::to_string(index) + ".f32"),
+                          std::ios::binary);
+        bin.write(reinterpret_cast<const char *>(descriptors.ptr()),
+                  static_cast<std::streamsize>(descriptors.total() * descriptors.elemSize()));
+      }
+    }
+  }
 
   cv::Ptr<cv::detail::BestOf2NearestMatcher> matcher =
       cv::makePtr<cv::detail::BestOf2NearestMatcher>(false, kMatchConfidence, 4,
@@ -419,6 +456,27 @@ StitchArtifacts PanoramaEngine::stitch(const StitchRequest &request) {
   matcher->collectGarbage();
   const double siftSeconds =
       (cv::getTickCount() - siftStarted) / cv::getTickFrequency();
+
+  if (const char *siftDirEnv = std::getenv("SPHERA_DEBUG_NATIVE_SIFT_DIR")) {
+    const std::filesystem::path siftDir(siftDirEnv);
+    const int n = static_cast<int>(features.size());
+    for (const auto &match : pairwiseMatches) {
+      if (match.src_img_idx < 0 || match.dst_img_idx < 0 ||
+          match.src_img_idx >= match.dst_img_idx) {
+        continue;
+      }
+      if ((match.src_img_idx == 6 && match.dst_img_idx == 15) ||
+          (match.src_img_idx <= 7 && match.dst_img_idx >= 15 &&
+           match.dst_img_idx <= 17)) {
+        std::fprintf(stderr, "native matches %d-%d count=%zu conf=%.4f inliers=%d\n",
+                     match.src_img_idx, match.dst_img_idx, match.matches.size(),
+                     match.confidence, match.num_inliers);
+      }
+    }
+    if (std::getenv("SPHERA_DEBUG_SIFT_ONLY")) {
+      throw std::runtime_error("sift-only diagnostic stop");
+    }
+  }
 
   if (request.enableLegacyLearnedMatches &&
       !request.learnedMatchCacheDirectory.empty()) {
@@ -512,12 +570,44 @@ StitchArtifacts PanoramaEngine::stitch(const StitchRequest &request) {
   for (int index = 0; index < frameCount; ++index) {
     cv::Mat fullImage =
         loadOrientedImage(frames[static_cast<std::size_t>(index)].input);
+    if (index == 0) {
+      cv::imwrite((request.outputDirectory / "debug_full_source_000.png").string(),
+                  fullImage);
+    }
     cv::Mat seamImage = resizedImage(fullImage, seamScale);
+    if (index == 0) {
+      cv::imwrite((request.outputDirectory / "debug_seam_source_000.png").string(),
+                  seamImage);
+    }
     cv::Mat sourceMask(seamImage.size(), CV_8U, cv::Scalar::all(255));
     const cv::Mat intrinsic =
         scaledCameraK(cameras[static_cast<std::size_t>(index)], seamWorkAspect);
     cv::Mat rotation32;
     cameras[static_cast<std::size_t>(index)].R.convertTo(rotation32, CV_32F);
+    if (index == 13) {
+      DebugSphericalWarper debugWarper(seamWarperScale);
+      const std::array<float, 10> debugProjection =
+          debugWarper.projection(intrinsic, rotation32);
+      std::ofstream projectionStream(
+          request.outputDirectory / "debug_projection_013.f32", std::ios::binary);
+      projectionStream.write(
+          reinterpret_cast<const char *>(debugProjection.data()),
+          static_cast<std::streamsize>(debugProjection.size() * sizeof(float)));
+      cv::UMat debugXMapU;
+      cv::UMat debugYMapU;
+      seamWarper->buildMaps(seamImage.size(), intrinsic, rotation32,
+                            debugXMapU, debugYMapU);
+      const cv::Mat debugXMap = debugXMapU.getMat(cv::ACCESS_READ);
+      const cv::Mat debugYMap = debugYMapU.getMat(cv::ACCESS_READ);
+      std::ofstream xStream(request.outputDirectory / "debug_xmap_013.f32",
+                            std::ios::binary);
+      std::ofstream yStream(request.outputDirectory / "debug_ymap_013.f32",
+                            std::ios::binary);
+      xStream.write(reinterpret_cast<const char *>(debugXMap.ptr<float>()),
+                    static_cast<std::streamsize>(debugXMap.total() * sizeof(float)));
+      yStream.write(reinterpret_cast<const char *>(debugYMap.ptr<float>()),
+                    static_cast<std::streamsize>(debugYMap.total() * sizeof(float)));
+    }
     cv::UMat warpedU;
     cv::UMat maskU;
     corners[static_cast<std::size_t>(index)] = seamWarper->warp(
@@ -527,6 +617,12 @@ StitchArtifacts PanoramaEngine::stitch(const StitchRequest &request) {
                      cv::BORDER_CONSTANT, maskU);
     warpedImages[static_cast<std::size_t>(index)] = warpedU.getMat(cv::ACCESS_READ).clone();
     warpedMasks[static_cast<std::size_t>(index)] = maskU.getMat(cv::ACCESS_READ).clone();
+    if (index == 13) {
+      cv::imwrite((request.outputDirectory / "debug_warped_013.png").string(),
+                  warpedImages[static_cast<std::size_t>(index)]);
+      cv::imwrite((request.outputDirectory / "debug_seam_source_013.png").string(),
+                  seamImage);
+    }
     layouts.push_back(frames[static_cast<std::size_t>(index)].layout);
   }
   const double seamWarpSeconds =
@@ -564,6 +660,21 @@ StitchArtifacts PanoramaEngine::stitch(const StitchRequest &request) {
   const int64 exposureStarted = cv::getTickCount();
   try {
     compensator->feed(corners, warpedImagesU, exposureMasksU);
+    if (const char *dump = std::getenv("SPHERA_DEBUG_NATIVE_GAIN_MAPS")) {
+      auto blocks = compensator.dynamicCast<cv::detail::BlocksGainCompensator>();
+      if (blocks) {
+        std::vector<cv::Mat> maps;
+        blocks->getMatGains(maps);
+        const std::filesystem::path directory(dump);
+        std::filesystem::create_directories(directory);
+        for (std::size_t index = 0; index < maps.size(); ++index) {
+          std::ofstream stream(directory / ("gain_" + std::to_string(index) + ".f32"),
+                               std::ios::binary);
+          stream.write(reinterpret_cast<const char *>(maps[index].ptr<float>()),
+                       static_cast<std::streamsize>(maps[index].total() * sizeof(float)));
+        }
+      }
+    }
   } catch (const cv::Exception &) {
     compensator = cv::makePtr<cv::detail::NoExposureCompensator>();
     exposureStatus = "disabled-after-open-cv-error";
@@ -709,6 +820,10 @@ StitchArtifacts PanoramaEngine::stitch(const StitchRequest &request) {
                             cv::BORDER_REFLECT, warpedImage);
     composeWarper->warp(sourceMask, intrinsic, rotation32, cv::INTER_NEAREST,
                         cv::BORDER_CONSTANT, warpedMask);
+    if (index == 0) {
+      cv::imwrite((request.outputDirectory / "debug_compose_raw_000.png").string(),
+                  warpedImage);
+    }
     compensator->apply(static_cast<int>(index), corner, warpedImage, warpedMask);
 
     const cv::Mat seamMask = transferSeamMask(
@@ -716,6 +831,41 @@ StitchArtifacts PanoramaEngine::stitch(const StitchRequest &request) {
         composeScale / seamScale, kSeamDilateIterations);
     cv::Mat selectedMask;
     cv::bitwise_and(warpedMask, seamMask, selectedMask);
+    if (index == 0) {
+      cv::imwrite((request.outputDirectory / "debug_compensated_000.png").string(),
+                  warpedImage);
+      cv::imwrite((request.outputDirectory / "debug_selected_000.png").string(),
+                  selectedMask);
+      cv::imwrite((request.outputDirectory / "debug_compose_geometric_000.png").string(),
+                  warpedMask);
+    }
+    if (const char *dump = std::getenv("SPHERA_DEBUG_NATIVE_BLEND_FEEDS")) {
+      const std::filesystem::path directory(dump);
+      std::filesystem::create_directories(directory);
+      cv::imwrite((directory / ("compensated_" + std::to_string(index) + ".png")).string(),
+                  warpedImage);
+      cv::imwrite((directory / ("selected_" + std::to_string(index) + ".png")).string(),
+                  selectedMask);
+      cv::imwrite((directory / ("geometric_" + std::to_string(index) + ".png")).string(),
+                  warpedMask);
+      cv::imwrite((directory / ("seam_expanded_" + std::to_string(index) + ".png")).string(),
+                  transferSeamMask(warpedMasks[index], corners[index], corner,
+                                   warpedMask.size(), composeScale / seamScale,
+                                   kSeamDilateIterations));
+      std::ofstream metadata(directory / ("layout_" + std::to_string(index) + ".txt"));
+      metadata << corners[index].x << ' ' << corners[index].y << ' '
+               << corner.x << ' ' << corner.y << ' ' << warpedMask.cols << ' '
+               << warpedMask.rows << '\n';
+      if (index == 0) {
+        std::ofstream raw((directory / "gain_map_resized_0.f32").string(), std::ios::binary);
+        cv::Mat gainMap;
+        std::vector<cv::Mat> gainMaps;
+        compensator->getMatGains(gainMaps);
+        cv::resize(gainMaps[0], gainMap, warpedImage.size(), 0, 0, cv::INTER_LINEAR);
+        raw.write(reinterpret_cast<const char *>(gainMap.ptr<float>()),
+                  static_cast<std::streamsize>(gainMap.total() * sizeof(float)));
+      }
+    }
     if (cv::countNonZero(selectedMask) == 0) {
       continue;
     }
@@ -800,6 +950,8 @@ StitchArtifacts PanoramaEngine::stitch(const StitchRequest &request) {
             equirectangularMask(cv::Rect(0, dstY, panoramaMask.cols, copyHeight)));
   }
   makeLongitudeBoundaryContinuous(equirectangular, equirectangularMask);
+  cv::imwrite((request.outputDirectory / "debug_pre_polar.png").string(),
+              equirectangular);
   const double blendStageSeconds =
       (cv::getTickCount() - blendStageStarted) / cv::getTickFrequency();
 
