@@ -107,6 +107,7 @@ struct GalleryView: View {
         package: package,
         onShare: { await presentShare(for: package) }
       )
+      .navigationTransition(.zoom(sourceID: package.manifest.sessionID, in: galleryZoom))
     } else {
       GalleryDetailView(
         model: model,
@@ -257,6 +258,7 @@ private struct GalleryPanoramaView: View {
     }
     .toolbar(.hidden, for: .tabBar)
     .toolbarVisibility(.hidden, for: .tabBar)
+    .disableNavigationZoomDismissGestures()
     .task {
       try? await Task.sleep(for: .milliseconds(480))
       withAnimation(.easeOut(duration: 0.35)) {
@@ -538,6 +540,62 @@ private extension View {
       matchedTransitionSource(id: id, in: namespace)
     } else {
       self
+    }
+  }
+
+  func disableNavigationZoomDismissGestures() -> some View {
+    modifier(NavigationZoomDismissGestureDisablerModifier())
+  }
+}
+
+private struct NavigationZoomDismissGestureDisablerModifier: ViewModifier {
+  func body(content: Content) -> some View {
+    content
+      .background(NavigationZoomDismissGestureDisabler())
+  }
+}
+
+private struct NavigationZoomDismissGestureDisabler: UIViewControllerRepresentable {
+  func makeUIViewController(context: Context) -> UIViewController {
+    let vc = UIViewController()
+    vc.view.backgroundColor = .clear
+    vc.view.isUserInteractionEnabled = false
+    return vc
+  }
+
+  func updateUIViewController(_ viewController: UIViewController, context: Context) {
+    Task { @MainActor in
+      Self.applyGestureStates(viewController: viewController, isEnabled: false)
+    }
+  }
+
+  static func dismantleUIViewController(_ viewController: UIViewController, coordinator: ()) {
+    applyGestureStates(viewController: viewController, isEnabled: true)
+  }
+
+  @MainActor
+  private static func applyGestureStates(viewController: UIViewController, isEnabled: Bool) {
+    var current: UIViewController? = viewController
+    while let vc = current {
+      if let gestures = vc.view.gestureRecognizers {
+        for gesture in gestures {
+          let name = String(describing: type(of: gesture))
+          if name.contains("Parallax") || name.contains("SwipeDismiss") || name.contains("SwipeDown") || name.contains("Transform") || name.contains("ZoomTransition") {
+            gesture.isEnabled = isEnabled
+          }
+        }
+      }
+      if let nav = vc as? UINavigationController ?? vc.navigationController {
+        if let navGestures = nav.view.gestureRecognizers {
+          for gesture in navGestures {
+            let name = String(describing: type(of: gesture))
+            if name.contains("Parallax") || name.contains("SwipeDismiss") || name.contains("SwipeDown") || name.contains("Transform") || name.contains("ZoomTransition") {
+              gesture.isEnabled = isEnabled
+            }
+          }
+        }
+      }
+      current = vc.parent
     }
   }
 }

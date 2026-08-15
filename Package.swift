@@ -4,6 +4,7 @@ import PackageDescription
 
 let package = Package(
   name: "SpheraCoreVerification",
+  defaultLocalization: "en",
   platforms: [.macOS(.v15)],
   products: [
     .library(name: "SpheraCore", targets: ["SpheraCore"])
@@ -16,6 +17,7 @@ let package = Package(
         "EngineBridge",
         "ExperimentalSpheraEngine.swift",
         "Resources",
+        "Settings.bundle",
         "CameraCaptureService.swift",
         "CameraPreviewView.swift",
         "CaptureGuideView.swift",

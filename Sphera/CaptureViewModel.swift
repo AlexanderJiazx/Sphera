@@ -37,6 +37,11 @@ enum ManualParameter: String, CaseIterable, Identifiable, Sendable {
 final class CaptureViewModel: ObservableObject {
   private static let configurationKey = "sphera.captureConfiguration"
   private static let autoFireCaptureKey = "sphera.autoFireCapture"
+  private static let alignmentToleranceKey = "sphera.alignmentToleranceDegrees"
+  private static let stableHoldDurationKey = "sphera.stableHoldDurationSeconds"
+  private static let horizontalCountKey = "sphera.horizontalCount"
+  private static let downwardCountKey = "sphera.downwardCount"
+  private static let upwardCountKey = "sphera.upwardCount"
   private static let cameraModeKey = "sphera.cameraMode"
   private static let isShutterAutoKey = "sphera.isShutterAuto"
   private static let isISOAutoKey = "sphera.isISOAuto"
@@ -47,14 +52,32 @@ final class CaptureViewModel: ObservableObject {
   private static let manualFocusLensPositionKey = "sphera.manualFocusLensPosition"
   private static let manualTemperatureKelvinKey = "sphera.manualTemperatureKelvin"
   private static let experimentalMetalStitchKey = "useExperimentalMetalStitch"
+  public static let viewerScrollModeKey = "sphera.viewerScrollMode"
+
+  private var isUpdatingFromDefaults = false
+
+  static func registerDefaults() {
+    UserDefaults.standard.register(defaults: [
+      autoFireCaptureKey: true,
+      alignmentToleranceKey: "6",
+      stableHoldDurationKey: "0.3",
+      horizontalCountKey: "\(CaptureConfiguration.debugPreset.horizontalCount)",
+      downwardCountKey: "\(CaptureConfiguration.debugPreset.downwardCount)",
+      upwardCountKey: "\(CaptureConfiguration.debugPreset.upwardCount)",
+      experimentalMetalStitchKey: false,
+      viewerScrollModeKey: "screenRelative",
+    ])
+  }
 
   @Published var configuration: CaptureConfiguration {
     didSet {
+      guard !isUpdatingFromDefaults else { return }
       Self.saveConfiguration(configuration)
     }
   }
   @Published var autoFireCapture: Bool {
     didSet {
+      guard !isUpdatingFromDefaults else { return }
       UserDefaults.standard.set(autoFireCapture, forKey: Self.autoFireCaptureKey)
     }
   }
@@ -143,6 +166,7 @@ final class CaptureViewModel: ObservableObject {
   /// unless the user turns this on.
   @Published var useExperimentalMetalStitch: Bool {
     didSet {
+      guard !isUpdatingFromDefaults else { return }
       UserDefaults.standard.set(
         useExperimentalMetalStitch,
         forKey: Self.experimentalMetalStitchKey
@@ -162,6 +186,7 @@ final class CaptureViewModel: ObservableObject {
     packageStore: CapturePackageStore = CapturePackageStore(),
     stitcher: (any PanoramaStitching)? = nil
   ) {
+    Self.registerDefaults()
     let motion = MotionTrackingService()
     self.motion = motion
     let camera = CameraCaptureService(motionStore: motion.sampleStore)
@@ -221,6 +246,13 @@ final class CaptureViewModel: ObservableObject {
       }
       .store(in: &subscriptions)
 
+    NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification)
+      .receive(on: DispatchQueue.main)
+      .sink { [weak self] _ in
+        self?.reloadSettingsFromDefaults()
+      }
+      .store(in: &subscriptions)
+
     Publishers.CombineLatest(camera.$isFeedActive, camera.$state)
       .receive(on: DispatchQueue.main)
       .sink { [weak self] isFeedActive, state in
@@ -238,15 +270,135 @@ final class CaptureViewModel: ObservableObject {
       .store(in: &subscriptions)
   }
 
+  func reloadSettingsFromDefaults() {
+    guard !isUpdatingFromDefaults else { return }
+    isUpdatingFromDefaults = true
+    defer { isUpdatingFromDefaults = false }
+
+    let newAutoFire = UserDefaults.standard.object(forKey: Self.autoFireCaptureKey) != nil
+      ? UserDefaults.standard.bool(forKey: Self.autoFireCaptureKey)
+      : true
+    if autoFireCapture != newAutoFire {
+      autoFireCapture = newAutoFire
+    }
+
+    let newMetal = UserDefaults.standard.bool(forKey: Self.experimentalMetalStitchKey)
+    if useExperimentalMetalStitch != newMetal {
+      useExperimentalMetalStitch = newMetal
+    }
+
+    let newConfig = Self.loadSavedConfiguration()
+    if configuration != newConfig {
+      configuration = newConfig
+      rebuildPlan()
+    }
+  }
+
+  private static func parseDouble(
+    forKey key: String,
+    fallback: Double,
+    min: Double? = nil,
+    max: Double? = nil
+  ) -> Double {
+    guard let raw = UserDefaults.standard.object(forKey: key) else { return fallback }
+    let value: Double
+    if let num = raw as? NSNumber {
+      value = num.doubleValue
+    } else if let str = raw as? String,
+              let parsed = Double(str.trimmingCharacters(in: .whitespacesAndNewlines)) {
+      value = parsed
+    } else {
+      value = fallback
+    }
+    var clamped = value
+    if let min { clamped = Swift.max(min, clamped) }
+    if let max { clamped = Swift.min(max, clamped) }
+    return clamped
+  }
+
+  private static func parseInt(
+    forKey key: String,
+    fallback: Int,
+    min: Int? = nil,
+    max: Int? = nil
+  ) -> Int {
+    guard let raw = UserDefaults.standard.object(forKey: key) else { return fallback }
+    let value: Int
+    if let num = raw as? NSNumber {
+      value = Int(round(num.doubleValue))
+    } else if let str = raw as? String,
+              let parsed = Double(str.trimmingCharacters(in: .whitespacesAndNewlines)) {
+      value = Int(round(parsed))
+    } else {
+      value = fallback
+    }
+    var clamped = value
+    if let min { clamped = Swift.max(min, clamped) }
+    if let max { clamped = Swift.min(max, clamped) }
+    return clamped
+  }
+
   private static func loadSavedConfiguration() -> CaptureConfiguration {
+    var config = CaptureConfiguration.debugPreset
+
     if let data = UserDefaults.standard.data(forKey: configurationKey),
        let decoded = try? JSONDecoder().decode(CaptureConfiguration.self, from: data) {
-      return decoded
+      config = decoded
     }
-    return .debugPreset
+
+    if UserDefaults.standard.object(forKey: alignmentToleranceKey) != nil {
+      config.alignmentToleranceDegrees = parseDouble(
+        forKey: alignmentToleranceKey,
+        fallback: config.alignmentToleranceDegrees,
+        min: 3,
+        max: 15
+      )
+    }
+    if UserDefaults.standard.object(forKey: stableHoldDurationKey) != nil {
+      config.stableHoldDurationSeconds = parseDouble(
+        forKey: stableHoldDurationKey,
+        fallback: config.stableHoldDurationSeconds,
+        min: 0.1,
+        max: 1.5
+      )
+    }
+    if UserDefaults.standard.object(forKey: horizontalCountKey) != nil {
+      config.horizontalCount = parseInt(
+        forKey: horizontalCountKey,
+        fallback: config.horizontalCount,
+        min: 4,
+        max: 16
+      )
+    }
+    if UserDefaults.standard.object(forKey: downwardCountKey) != nil {
+      config.downwardCount = parseInt(
+        forKey: downwardCountKey,
+        fallback: config.downwardCount,
+        min: 4,
+        max: 8
+      )
+    }
+    if UserDefaults.standard.object(forKey: upwardCountKey) != nil {
+      config.upwardCount = parseInt(
+        forKey: upwardCountKey,
+        fallback: config.upwardCount,
+        min: 4,
+        max: 8
+      )
+    }
+
+    return config
   }
 
   private static func saveConfiguration(_ config: CaptureConfiguration) {
+    let toleranceString = config.alignmentToleranceDegrees.truncatingRemainder(dividingBy: 1) == 0
+      ? "\(Int(config.alignmentToleranceDegrees))"
+      : String(format: "%.1f", config.alignmentToleranceDegrees)
+    UserDefaults.standard.set(toleranceString, forKey: alignmentToleranceKey)
+    UserDefaults.standard.set(String(format: "%.1f", config.stableHoldDurationSeconds), forKey: stableHoldDurationKey)
+    UserDefaults.standard.set("\(config.horizontalCount)", forKey: horizontalCountKey)
+    UserDefaults.standard.set("\(config.downwardCount)", forKey: downwardCountKey)
+    UserDefaults.standard.set("\(config.upwardCount)", forKey: upwardCountKey)
     if let encoded = try? JSONEncoder().encode(config) {
       UserDefaults.standard.set(encoded, forKey: configurationKey)
     }
@@ -279,8 +431,8 @@ final class CaptureViewModel: ObservableObject {
 
   func rebuildPlan() {
     configuration.horizontalCount = min(16, max(4, configuration.horizontalCount))
-    configuration.downwardCount = min(6, max(4, configuration.downwardCount))
-    configuration.upwardCount = min(6, max(4, configuration.upwardCount))
+    configuration.downwardCount = min(8, max(4, configuration.downwardCount))
+    configuration.upwardCount = min(8, max(4, configuration.upwardCount))
     switch phase {
     case .setup, .saved, .completed, .failed:
       plan = CapturePlan(configuration: configuration)

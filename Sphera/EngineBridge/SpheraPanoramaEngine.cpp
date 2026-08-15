@@ -15,6 +15,7 @@
 #include <opencv2/features2d.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
+#include <opencv2/photo.hpp>
 #include <opencv2/stitching/detail/blenders.hpp>
 #include <opencv2/stitching/detail/camera.hpp>
 #include <opencv2/stitching/detail/exposure_compensate.hpp>
@@ -325,31 +326,40 @@ bool feedPeriodicImage(cv::detail::Blender &blender, const cv::Mat &image,
   return contributed;
 }
 
-void makeLongitudeBoundaryContinuous(cv::Mat &panorama, cv::Mat &mask) {
-  if (panorama.cols < 2 || panorama.type() != CV_8UC3 || mask.type() != CV_8U) {
+void makeLongitudeBoundaryContinuous(cv::Mat &panorama, cv::Mat &mask, int blendRadius = 4) {
+  if (panorama.cols < 2 * blendRadius + 2 || panorama.type() != CV_8UC3 || mask.type() != CV_8U) {
     return;
   }
+  const int width = panorama.cols;
   for (int row = 0; row < panorama.rows; ++row) {
     const bool leftValid = mask.at<uchar>(row, 0) != 0;
-    const bool rightValid = mask.at<uchar>(row, panorama.cols - 1) != 0;
+    const bool rightValid = mask.at<uchar>(row, width - 1) != 0;
     if (leftValid && rightValid) {
-      const cv::Vec3b left = panorama.at<cv::Vec3b>(row, 0);
-      const cv::Vec3b right = panorama.at<cv::Vec3b>(row, panorama.cols - 1);
-      cv::Vec3b average;
-      for (int channel = 0; channel < 3; ++channel) {
-        average[channel] = static_cast<uchar>(
-            (static_cast<unsigned int>(left[channel]) + right[channel]) / 2);
+      for (int i = 0; i <= blendRadius; ++i) {
+        const double weightLeft = 0.5 + 0.5 * (static_cast<double>(blendRadius - i) / (blendRadius + 1));
+        const double weightRight = 1.0 - weightLeft;
+        const cv::Vec3b leftPixel = panorama.at<cv::Vec3b>(row, i);
+        const cv::Vec3b rightPixel = panorama.at<cv::Vec3b>(row, width - 1 - i);
+
+        cv::Vec3b blended;
+        for (int channel = 0; channel < 3; ++channel) {
+          blended[channel] = static_cast<uchar>(std::clamp(
+              std::lround(leftPixel[channel] * weightLeft + rightPixel[channel] * weightRight),
+              0L, 255L));
+        }
+        panorama.at<cv::Vec3b>(row, i) = blended;
+        panorama.at<cv::Vec3b>(row, width - 1 - i) = blended;
       }
-      panorama.at<cv::Vec3b>(row, 0) = average;
-      panorama.at<cv::Vec3b>(row, panorama.cols - 1) = average;
     } else if (leftValid) {
-      panorama.at<cv::Vec3b>(row, panorama.cols - 1) =
-          panorama.at<cv::Vec3b>(row, 0);
-      mask.at<uchar>(row, panorama.cols - 1) = 255;
+      for (int i = 0; i <= blendRadius; ++i) {
+        panorama.at<cv::Vec3b>(row, width - 1 - i) = panorama.at<cv::Vec3b>(row, 0);
+        mask.at<uchar>(row, width - 1 - i) = 255;
+      }
     } else if (rightValid) {
-      panorama.at<cv::Vec3b>(row, 0) =
-          panorama.at<cv::Vec3b>(row, panorama.cols - 1);
-      mask.at<uchar>(row, 0) = 255;
+      for (int i = 0; i <= blendRadius; ++i) {
+        panorama.at<cv::Vec3b>(row, i) = panorama.at<cv::Vec3b>(row, width - 1);
+        mask.at<uchar>(row, i) = 255;
+      }
     }
   }
 }
@@ -1022,6 +1032,13 @@ StitchArtifacts PanoramaEngine::stitch(const StitchRequest &request) {
       contributionPixels[index] +=
           directSphereFill.filledPixelsByInput[index];
     }
+  }
+  if (cv::countNonZero(equirectangularMask == 0) > 0) {
+    cv::Mat missingHoles = (equirectangularMask == 0);
+    cv::Mat inpainted;
+    cv::inpaint(equirectangular, missingHoles, inpainted, 5.0, cv::INPAINT_TELEA);
+    inpainted.copyTo(equirectangular);
+    equirectangularMask.setTo(255);
   }
   makeLongitudeBoundaryContinuous(equirectangular, equirectangularMask);
 

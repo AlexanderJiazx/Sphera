@@ -1,0 +1,17 @@
+/* Root.strings for Sphera Settings.bundle */
+
+"Capture Alignment & Auto-Fire" = "Capture Alignment & Auto-Fire";
+"When auto-fire is on, Sphera captures automatically after holding steady on the target. Enter numeric values for tolerance (3°–15°) and hold duration (0.1s–1.5s)." = "When auto-fire is on, Sphera captures automatically after holding steady on the target. Enter numeric values for tolerance (3°–15°) and hold duration (0.1s–1.5s).";
+"Auto-fire capture" = "Auto-fire capture";
+"Alignment tolerance (°)" = "Alignment tolerance (°)";
+"Stable hold duration (s)" = "Stable hold duration (s)";
+
+"Capture preset" = "Capture preset";
+"Changes apply the next time a capture session starts. All settings are automatically saved." = "Changes apply the next time a capture session starts. All settings are automatically saved.";
+"Horizontal ring (4 – 16)" = "Horizontal ring (4 – 16)";
+"Downward ring (4 – 8)" = "Downward ring (4 – 8)";
+"Upward ring (4 – 8)" = "Upward ring (4 – 8)";
+
+"On-device compute" = "On-device compute";
+"Off by default. When off, Compute on device uses the stable OpenCV engine. When on, it uses the experimental 3-second Swift/Metal engine (no OpenCV)." = "Off by default. When off, Compute on device uses the stable OpenCV engine. When on, it uses the experimental 3-second Swift/Metal engine (no OpenCV).";
+"Experimental Metal stitch" = "Experimental Metal stitch";

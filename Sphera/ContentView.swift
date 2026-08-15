@@ -9,25 +9,19 @@ struct ContentView: View {
     TabView(selection: $selectedTab) {
       CaptureTabView(model: model, isSelected: selectedTab == 0)
         .tabItem {
-          Label("Capture", systemImage: "camera.fill")
+          Image(systemName: "camera.fill")
         }
+        .accessibilityLabel("Capture")
         .tag(0)
 
       NavigationStack {
         GalleryView(model: model)
       }
       .tabItem {
-        Label("Gallery", systemImage: "photo.on.rectangle.angled")
+        Image(systemName: "photo.on.rectangle.angled")
       }
+      .accessibilityLabel("Gallery")
       .tag(1)
-
-      NavigationStack {
-        SettingsView(model: model)
-      }
-      .tabItem {
-        Label("Settings", systemImage: "gearshape.fill")
-      }
-      .tag(2)
     }
     .preferredColorScheme(.dark)
     .onChange(of: selectedTab, initial: true) { _, tab in
@@ -112,79 +106,6 @@ private struct CaptureTabView: View {
       if isSelected, phase == .setup {
         model.startCapture()
       }
-    }
-  }
-}
-
-private struct SettingsView: View {
-  @ObservedObject var model: CaptureViewModel
-
-  var body: some View {
-    Form {
-      Section {
-        Toggle("Auto-fire capture", isOn: $model.autoFireCapture)
-        Stepper(value: $model.configuration.alignmentToleranceDegrees, in: 3...15, step: 1) {
-          HStack {
-            Text("Alignment tolerance")
-            Spacer()
-            Text("\(Int(model.configuration.alignmentToleranceDegrees))°")
-              .monospacedDigit()
-              .foregroundStyle(.secondary)
-          }
-        }
-        Stepper(value: $model.configuration.stableHoldDurationSeconds, in: 0.1...1.5, step: 0.1) {
-          HStack {
-            Text("Stable hold duration")
-            Spacer()
-            Text(model.configuration.stableHoldDurationSeconds, format: .number.precision(.fractionLength(1))) + Text("s")
-              .monospacedDigit()
-              .foregroundStyle(.secondary)
-          }
-        }
-      } header: {
-        Text("Capture Alignment & Auto-Fire")
-      } footer: {
-        Text("When auto-fire is on, Sphera captures automatically after holding steady on the target. Error tolerance sets the allowable angular distance (default 6°).")
-      }
-
-      Section {
-        Stepper(value: $model.configuration.horizontalCount, in: 4...16) {
-          countRow("Horizontal ring", model.configuration.horizontalCount)
-        }
-        Stepper(value: $model.configuration.downwardCount, in: 4...6) {
-          countRow("Downward ring", model.configuration.downwardCount)
-        }
-        Stepper(value: $model.configuration.upwardCount, in: 4...6) {
-          countRow("Upward ring", model.configuration.upwardCount)
-        }
-        countRow("Total frames", model.configuration.totalImageCount)
-      } header: {
-        Text("Capture preset")
-      } footer: {
-        Text("Changes apply the next time a capture session starts. All settings are automatically saved.")
-      }
-
-      Section {
-        Toggle("Experimental Metal stitch", isOn: $model.useExperimentalMetalStitch)
-      } header: {
-        Text("On-device compute")
-      } footer: {
-        Text("Off by default. When off, Compute on device uses the stable OpenCV engine. When on, it uses the experimental 3-second Swift/Metal engine (no OpenCV).")
-      }
-    }
-    .navigationTitle("Settings")
-    .onChange(of: model.configuration) {
-      model.rebuildPlan()
-    }
-  }
-
-  private func countRow(_ title: String, _ count: Int) -> some View {
-    HStack {
-      Text(title)
-      Spacer()
-      Text(count, format: .number)
-        .monospacedDigit()
-        .foregroundStyle(.secondary)
     }
   }
 }

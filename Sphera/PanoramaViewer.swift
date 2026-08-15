@@ -4,6 +4,20 @@ import simd
 import SwiftUI
 import UIKit
 
+public enum PanoramaScrollMode: String, CaseIterable, Identifiable {
+  case screenRelative = "screenRelative"
+  case worldAxis = "worldAxis"
+
+  public var id: String { rawValue }
+
+  public var title: String {
+    switch self {
+    case .screenRelative: return "Screen-Relative"
+    case .worldAxis: return "World-Axis"
+    }
+  }
+}
+
 /// Equirectangular panorama viewer driven by touch and device rotation.
 ///
 /// Device motion must NOT use CMAttitude.roll/pitch/yaw. Those Euler angles are
@@ -12,9 +26,10 @@ import UIKit
 /// quaternion into SceneKit instead — same approach as CTPanoramaView.
 struct PanoramaViewer: UIViewRepresentable {
   let imageURL: URL
+  var scrollMode: PanoramaScrollMode? = nil
 
   func makeCoordinator() -> Coordinator {
-    Coordinator()
+    Coordinator(scrollModeOverride: scrollMode)
   }
 
   func makeUIView(context: Context) -> SCNView {
@@ -43,6 +58,7 @@ struct PanoramaViewer: UIViewRepresentable {
     )
     pan.minimumNumberOfTouches = 1
     pan.maximumNumberOfTouches = 2
+    pan.cancelsTouchesInView = true
     pan.delegate = context.coordinator
     view.addGestureRecognizer(pan)
 
@@ -50,6 +66,7 @@ struct PanoramaViewer: UIViewRepresentable {
       target: context.coordinator,
       action: #selector(Coordinator.pinch(_:))
     )
+    pinch.cancelsTouchesInView = true
     pinch.delegate = context.coordinator
     view.addGestureRecognizer(pinch)
 
@@ -57,6 +74,7 @@ struct PanoramaViewer: UIViewRepresentable {
       target: context.coordinator,
       action: #selector(Coordinator.rotate(_:))
     )
+    rotation.cancelsTouchesInView = true
     rotation.delegate = context.coordinator
     view.addGestureRecognizer(rotation)
 
@@ -67,6 +85,7 @@ struct PanoramaViewer: UIViewRepresentable {
   }
 
   func updateUIView(_ view: SCNView, context: Context) {
+    context.coordinator.scrollModeOverride = scrollMode
     guard context.coordinator.loadedURL != imageURL else { return }
     context.coordinator.installPanorama(from: imageURL, in: view)
   }
@@ -80,6 +99,21 @@ struct PanoramaViewer: UIViewRepresentable {
     fileprivate weak var sceneView: SCNView?
     fileprivate var loadedURL: URL?
     fileprivate var fieldOfView: CGFloat = 72
+    fileprivate var scrollModeOverride: PanoramaScrollMode?
+
+    private var activeScrollMode: PanoramaScrollMode {
+      if let scrollModeOverride { return scrollModeOverride }
+      if let raw = UserDefaults.standard.string(forKey: "sphera.viewerScrollMode"),
+         let mode = PanoramaScrollMode(rawValue: raw) {
+        return mode
+      }
+      return .screenRelative
+    }
+
+    init(scrollModeOverride: PanoramaScrollMode? = nil) {
+      self.scrollModeOverride = scrollModeOverride
+      super.init()
+    }
 
     private let motionManager = CMMotionManager()
     /// Latest absolute CM attitude quaternion (device → reference frame).
@@ -113,13 +147,17 @@ struct PanoramaViewer: UIViewRepresentable {
       material.cullMode = .front
       material.isDoubleSided = false
       material.diffuse.contents = image
-      // Inside-sphere viewing mirrors S; flip it back so right stays right.
-      material.diffuse.contentsTransform = SCNMatrix4MakeScale(-1, 1, 1)
       material.diffuse.wrapS = .repeat
       material.diffuse.wrapT = .clamp
+      material.diffuse.minificationFilter = .linear
+      material.diffuse.magnificationFilter = .linear
+      material.diffuse.mipFilter = .linear
       sphere.materials = [material]
 
       let node = SCNNode(geometry: sphere)
+      // Mirror along Z in 3D geometry rather than UV matrix so texture coordinates
+      // remain strictly monotonic [0, 1] without wrapping backwards across the seam quad.
+      node.scale = SCNVector3(1, 1, -1)
       node.simdOrientation = sphereOrientation
       view.scene?.rootNode.addChildNode(node)
       panoramaNode = node
@@ -195,16 +233,42 @@ struct PanoramaViewer: UIViewRepresentable {
       return otherGestureRecognizer.view == view
     }
 
+    func gestureRecognizer(
+      _ gestureRecognizer: UIGestureRecognizer,
+      shouldBeRequiredToFailBy otherGestureRecognizer: UIGestureRecognizer
+    ) -> Bool {
+      guard let view = sceneView else { return false }
+      return otherGestureRecognizer.view != view
+    }
+
     private func applyTouchDelta(yaw: Float, pitch: Float, roll: Float) {
       guard let cameraNode else { return }
-      let qYaw = simd_quatf(angle: yaw, axis: SIMD3<Float>(0, 1, 0))
-      let qPitch = simd_quatf(angle: pitch, axis: SIMD3<Float>(1, 0, 0))
-      let qRoll = simd_quatf(angle: roll, axis: SIMD3<Float>(0, 0, 1))
-      let qDeltaCam = qYaw * qPitch * qRoll
-
       let camOrient = cameraNode.simdOrientation
-      let qDeltaWorld = camOrient * qDeltaCam * camOrient.inverse
 
+      // 1. Horizontal swipe:
+      // - Screen-Relative (default): rotates around camera's screen-vertical axis (camUp)
+      //   so dragging left/right moves the view horizontally across the screen regardless of tilt.
+      // - World-Axis (configurable): rotates strictly around global world-vertical axis (0, 1, 0)
+      //   matching consistent gyro heading rotation.
+      let qYawWorld: simd_quatf
+      if activeScrollMode == .worldAxis {
+        let worldUp = SIMD3<Float>(0, 1, 0)
+        qYawWorld = simd_quatf(angle: yaw, axis: worldUp)
+      } else {
+        let camUp = simd_act(camOrient, SIMD3<Float>(0, 1, 0))
+        qYawWorld = simd_quatf(angle: yaw, axis: camUp)
+      }
+
+      // 2. Vertical swipe tilts around the camera's screen-horizontal axis (camRight)
+      //    so dragging up/down tilts the view vertically across the screen.
+      let camRight = simd_act(camOrient, SIMD3<Float>(1, 0, 0))
+      let qPitchWorld = simd_quatf(angle: pitch, axis: camRight)
+
+      // 3. Two-finger twist rotates around the camera's line of sight (camLook).
+      let camLook = simd_act(camOrient, SIMD3<Float>(0, 0, 1))
+      let qRollWorld = simd_quatf(angle: roll, axis: camLook)
+
+      let qDeltaWorld = qYawWorld * qPitchWorld * qRollWorld
       sphereOrientation = simd_normalize(qDeltaWorld * sphereOrientation)
 
       SCNTransaction.begin()
