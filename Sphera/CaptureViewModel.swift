@@ -2,12 +2,6 @@ import Combine
 import Foundation
 import UIKit
 
-struct CaptureCompletion: Equatable, Sendable {
-  let package: CapturePackage
-  let stitchingResult: StitchingResult?
-  let stitchingMessage: String?
-}
-
 enum CaptureWorkflowPhase: Equatable {
   case setup
   case preparing
@@ -15,7 +9,6 @@ enum CaptureWorkflowPhase: Equatable {
   case capturingPoints
   case saved(CapturePackage)
   case stitching
-  case completed(CaptureCompletion)
   case failed(String)
 }
 
@@ -434,7 +427,7 @@ final class CaptureViewModel: ObservableObject {
     configuration.downwardCount = min(8, max(4, configuration.downwardCount))
     configuration.upwardCount = min(8, max(4, configuration.upwardCount))
     switch phase {
-    case .setup, .saved, .completed, .failed:
+    case .setup, .saved, .failed:
       plan = CapturePlan(configuration: configuration)
     default:
       break
@@ -659,13 +652,7 @@ final class CaptureViewModel: ObservableObject {
         }
       }
       stitchProgress = nil
-      phase = .completed(
-        CaptureCompletion(
-          package: package,
-          stitchingResult: result,
-          stitchingMessage: nil
-        )
-      )
+      phase = .setup
       if usingExperimental, let elapsed = result.elapsedSeconds {
         statusMessage = String(
           format: "Experimental Metal stitch complete in %.2fs",
@@ -677,13 +664,7 @@ final class CaptureViewModel: ObservableObject {
       await refreshGallery()
     } catch {
       stitchProgress = nil
-      phase = .completed(
-        CaptureCompletion(
-          package: package,
-          stitchingResult: nil,
-          stitchingMessage: error.localizedDescription
-        )
-      )
+      phase = .setup
       statusMessage = replaceExisting
         ? "Panorama recompute failed"
         : "On-device compute failed"
@@ -1100,7 +1081,7 @@ final class CaptureViewModel: ObservableObject {
 extension CaptureWorkflowPhase {
   fileprivate var isTerminal: Bool {
     switch self {
-    case .saved, .completed, .failed:
+    case .saved, .failed:
       true
     default:
       false

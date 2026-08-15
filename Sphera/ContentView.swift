@@ -92,13 +92,20 @@ private struct CaptureTabView: View {
           title: "Computing panorama",
           detail: model.statusMessage
         )
-      case .completed(let completion):
-        CaptureResultView(completion: completion) {
-          model.returnToSetup()
-        }
       case .failed(let message):
         FailureView(message: message) {
           model.returnToSetup()
+        }
+      }
+    }
+    .onChange(of: isSelected) { _, selected in
+      if selected {
+        switch model.phase {
+        case .setup, .saved, .failed:
+          model.returnToSetup()
+          model.startCapture()
+        default:
+          break
         }
       }
     }
@@ -883,52 +890,6 @@ private struct StatusView: View {
   }
 }
 
-private struct CaptureResultView: View {
-  let completion: CaptureCompletion
-  let dismiss: () -> Void
-
-  var body: some View {
-    NavigationStack {
-      Group {
-        if let result = completion.stitchingResult {
-          PanoramaViewer(imageURL: result.panoramaURL)
-            .ignoresSafeArea()
-            .toolbar(.hidden, for: .tabBar)
-            .toolbarVisibility(.hidden, for: .tabBar)
-            .safeAreaInset(edge: .bottom) {
-              Button("Done", action: dismiss)
-                .buttonStyle(.borderedProminent)
-                .padding()
-            }
-        } else {
-          VStack(spacing: 18) {
-            Spacer()
-            Image(systemName: "exclamationmark.triangle")
-              .font(.system(size: 46))
-              .foregroundStyle(.orange)
-            Text("Compute unfinished")
-              .font(.title2.bold())
-            Text("The capture remains in the gallery with all frames and sensor data.")
-              .foregroundStyle(.secondary)
-              .multilineTextAlignment(.center)
-            if let message = completion.stitchingMessage {
-              Text(message)
-                .font(.callout)
-                .multilineTextAlignment(.center)
-                .foregroundStyle(.orange)
-            }
-            Spacer()
-            Button("Done", action: dismiss)
-              .buttonStyle(.borderedProminent)
-          }
-          .padding()
-        }
-      }
-      .navigationTitle("Panorama")
-      .navigationBarTitleDisplayMode(.inline)
-    }
-  }
-}
 
 private struct FailureView: View {
   let message: String
