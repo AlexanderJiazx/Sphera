@@ -1,24 +1,67 @@
 import Foundation
 
 enum CaptureShareArchive {
+  /// Builds a zip archive of an experimental ARKit capture. Includes images,
+  /// the session manifest, and per-frame ARKit/gyro sidecars. Does not include
+  /// an engine request — the current stitcher must not consume this dataset.
+  static func makeZip(
+    for package: ExperimentalCapturePackage,
+    fileManager: FileManager = .default
+  ) throws -> URL {
+    let zipURL = try makeArchiveURL(forSessionID: package.manifest.sessionID, date: package.manifest.completedAt ?? package.manifest.createdAt, fileManager: fileManager, prefix: "SpheraARKitCapture")
+    var entries: [(name: String, data: Data)] = []
+
+    let manifestData = try Data(contentsOf: package.manifestURL)
+    entries.append((name: "manifest.json", data: manifestData))
+
+    let imageDirectory = package.directoryURL
+      .appendingPathComponent(package.manifest.imageDirectory, isDirectory: true)
+    for frame in package.manifest.frames {
+      let imageURL = imageDirectory.appendingPathComponent(frame.imageFilename)
+      let data = try Data(contentsOf: imageURL)
+      entries.append((name: "\(package.manifest.imageDirectory)/\(frame.imageFilename)", data: data))
+
+      let sidecarName = frame.imageFilename.replacingOccurrences(of: ".jpg", with: ".json")
+      entries.append((name: "metadata/\(sidecarName)", data: try encodeExperimentalFrameSidecar(frame)))
+    }
+
+    let notes = """
+    # Sphera experimental ARKit panorama capture
+
+    This archive is from the experimental ARKit-guided capture mode.
+    It is a data collection package for a future computer-side stitcher.
+
+    Do not run it through the current on-device OpenCV/Metal stitching engine.
+
+    Contents:
+    - `manifest.json` — session configuration, scan-line summaries, and per-image records
+    - `images/` — JPEG keyframes named `{scanLine}_{index}_{frameUUID}.jpg`
+    - `metadata/` — the same records as `manifest.frames[]`, one file per image
+
+    Every image is matched to ARKit pose data by `id` / filename, not array order.
+    `arkit.transform` is the original column-major 4x4 camera matrix.
+    `motion` is the CoreMotion sample nearest to the exposure, including gyroscope rates.
+    """
+    if let notesData = notes.data(using: .utf8) {
+      entries.append((name: "ARKIT_EXPERIMENTAL_NOTES.md", data: notesData))
+    }
+
+    try ZipWriter.write(entries: entries, to: zipURL)
+    return zipURL
+  }
+
   /// Builds a zip archive of the capture package for the system share sheet.
   /// Includes images and per-photo metadata (`manifest.json`), plus the engine request copy when present.
   static func makeZip(
     for package: CapturePackage,
     fileManager: FileManager = .default
   ) throws -> URL {
-    let formatter = DateFormatter()
-    formatter.locale = Locale(identifier: "en_US_POSIX")
-    formatter.timeZone = TimeZone(secondsFromGMT: 0)
-    formatter.dateFormat = "yyyyMMdd-HHmmss"
-    let stamp = formatter.string(from: package.manifest.completedAt ?? package.manifest.createdAt)
-    let shortID = package.manifest.sessionID.uuidString.prefix(8)
-    let archiveName = "SpheraCapture-\(stamp)-\(shortID).zip"
-
-    let temporaryRoot = fileManager.temporaryDirectory
-      .appendingPathComponent("SpheraShare-\(UUID().uuidString)", isDirectory: true)
-    try fileManager.createDirectory(at: temporaryRoot, withIntermediateDirectories: true)
-    let zipURL = temporaryRoot.appendingPathComponent(archiveName)
+    let zipURL = try makeArchiveURL(
+      forSessionID: package.manifest.sessionID,
+      date: package.manifest.completedAt ?? package.manifest.createdAt,
+      fileManager: fileManager,
+      prefix: "SpheraCapture"
+    )
 
     var entries: [(name: String, data: Data)] = []
 
@@ -65,11 +108,39 @@ enum CaptureShareArchive {
     return zipURL
   }
 
+  private static func makeArchiveURL(
+    forSessionID sessionID: UUID,
+    date: Date,
+    fileManager: FileManager,
+    prefix: String
+  ) throws -> URL {
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.timeZone = TimeZone(secondsFromGMT: 0)
+    formatter.dateFormat = "yyyyMMdd-HHmmss"
+    let stamp = formatter.string(from: date)
+    let shortID = sessionID.uuidString.prefix(8)
+    let archiveName = "\(prefix)-\(stamp)-\(shortID).zip"
+
+    let temporaryRoot = fileManager.temporaryDirectory
+      .appendingPathComponent("SpheraShare-\(UUID().uuidString)", isDirectory: true)
+    try fileManager.createDirectory(at: temporaryRoot, withIntermediateDirectories: true)
+    return temporaryRoot.appendingPathComponent(archiveName)
+  }
+
   private static func encodeFrameSidecar(_ frame: CapturedFrameRecord) throws -> Data {
+    try encodeJSON(frame)
+  }
+
+  private static func encodeExperimentalFrameSidecar(_ frame: ExperimentalCapturedFrame) throws -> Data {
+    try encodeJSON(frame)
+  }
+
+  private static func encodeJSON<T: Encodable>(_ value: T) throws -> Data {
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
     encoder.dateEncodingStrategy = .secondsSince1970
-    return try encoder.encode(frame)
+    return try encoder.encode(value)
   }
 }
 

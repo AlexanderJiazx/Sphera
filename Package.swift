@@ -31,6 +31,11 @@ let package = Package(
         "PanoramaViewer.swift",
         "Sphera-Bridging-Header.h",
         "SpheraApp.swift",
+        "ARKitTrackingService.swift",
+        "ARKitCameraPreviewView.swift",
+        "ExperimentalCaptureController.swift",
+        "ExperimentalCaptureGuideView.swift",
+        "ExperimentalCaptureScreen.swift",
       ],
       sources: [
         "AlignmentHoldTracker.swift",
@@ -38,6 +43,11 @@ let package = Package(
         "CaptureModels.swift",
         "CapturePackageStore.swift",
         "CaptureShareArchive.swift",
+        "ExperimentalCaptureModels.swift",
+        "ExperimentalCapturePackageStore.swift",
+        "ExperimentalPanoramaConfiguration.swift",
+        "ExperimentalPoseMath.swift",
+        "ExperimentalScanProgressor.swift",
         "OrientationMath.swift",
         "PanoramaStitching.swift",
       ]

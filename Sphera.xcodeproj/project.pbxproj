@@ -290,7 +290,7 @@
 				);
 				FRAMEWORK_SEARCH_PATHS = "$(PROJECT_DIR)/Vendor/OpenCV";
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_NSCameraUsageDescription = "Sphera uses the ultra-wide camera to capture panorama source images.";
+				INFOPLIST_KEY_NSCameraUsageDescription = "Sphera uses the camera to capture panorama source images and, in experimental mode, ARKit world tracking.";
 				INFOPLIST_KEY_NSMotionUsageDescription = "Sphera uses device orientation to place panorama images and to look around completed panoramas.";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
@@ -319,6 +319,10 @@
 					QuartzCore,
 					"-framework",
 					Metal,
+					"-framework",
+					ARKit,
+					"-framework",
+					SceneKit,
 					"-framework",
 					ImageIO,
 					"-lc++",
@@ -368,7 +372,7 @@
 				);
 				FRAMEWORK_SEARCH_PATHS = "$(PROJECT_DIR)/Vendor/OpenCV";
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_NSCameraUsageDescription = "Sphera uses the ultra-wide camera to capture panorama source images.";
+				INFOPLIST_KEY_NSCameraUsageDescription = "Sphera uses the camera to capture panorama source images and, in experimental mode, ARKit world tracking.";
 				INFOPLIST_KEY_NSMotionUsageDescription = "Sphera uses device orientation to place panorama images and to look around completed panoramas.";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
@@ -397,6 +401,10 @@
 					QuartzCore,
 					"-framework",
 					Metal,
+					"-framework",
+					ARKit,
+					"-framework",
+					SceneKit,
 					"-framework",
 					ImageIO,
 					"-lc++",

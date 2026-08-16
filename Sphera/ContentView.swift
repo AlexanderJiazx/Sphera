@@ -4,6 +4,7 @@ struct ContentView: View {
   @StateObject private var model = CaptureViewModel()
   @State private var selectedTab = 0
   @State private var handledDebugLaunchArguments = false
+  @Environment(\.scenePhase) private var scenePhase
 
   var body: some View {
     TabView(selection: $selectedTab) {
@@ -26,6 +27,13 @@ struct ContentView: View {
     .preferredColorScheme(.dark)
     .onChange(of: selectedTab, initial: true) { _, tab in
       model.setCaptureTabActive(tab == 0)
+    }
+    .onChange(of: scenePhase) { _, phase in
+      if phase != .active {
+        model.handleAppBackground()
+      } else {
+        model.handleAppForeground()
+      }
     }
     .onAppear {
       #if DEBUG
@@ -80,30 +88,19 @@ private struct CaptureTabView: View {
 
   var body: some View {
     Group {
-      switch model.phase {
-      case .setup, .preparing:
-        StatusView(title: "Preparing capture", detail: model.statusMessage)
-      case .awaitingPrimary, .capturingPoints:
-        CaptureScreen(model: model)
-      case .saved(let package):
-        SavedCaptureView(package: package, model: model)
-      case .stitching:
-        StatusView(
-          title: "Computing panorama",
-          detail: model.statusMessage
-        )
-      case .failed(let message):
-        FailureView(message: message) {
-          model.returnToSetup()
-        }
+      if showsExperimentalCamera {
+        ExperimentalCaptureScreen(model: model)
+      } else {
+        standardCapturePhaseView
       }
     }
     .onChange(of: isSelected) { _, selected in
       if selected {
         switch model.phase {
-        case .setup, .saved, .failed:
-          model.returnToSetup()
+        case .setup:
           model.startCapture()
+        case .saved, .savedExperimental, .failed:
+          model.returnToSetup()
         default:
           break
         }
@@ -113,6 +110,49 @@ private struct CaptureTabView: View {
       if isSelected, phase == .setup {
         model.startCapture()
       }
+    }
+  }
+
+  private var showsExperimentalCamera: Bool {
+    switch model.phase {
+    case .preparing, .experimentalReady, .experimentalScanning:
+      model.captureSessionMode == .experimentalARKit
+    default:
+      false
+    }
+  }
+
+  @ViewBuilder
+  private var standardCapturePhaseView: some View {
+    switch model.phase {
+    case .setup, .preparing:
+      StatusView(title: "Preparing capture", detail: model.statusMessage)
+    case .awaitingPrimary, .capturingPoints:
+      CaptureScreen(model: model)
+    case .experimentalReady, .experimentalScanning:
+      ExperimentalCaptureScreen(model: model)
+    case .saved(let package):
+      SavedCaptureView(package: package, model: model)
+    case .savedExperimental(let package):
+      ExperimentalSavedCaptureView(package: package, model: model)
+    case .stitching:
+      StatusView(
+        title: "Computing panorama",
+        detail: model.statusMessage
+      )
+    case .failed(let message):
+      FailureView(
+        message: message,
+        retry: {
+          model.returnToSetup()
+        },
+        alternativeTitle: model.captureSessionMode == .experimentalARKit
+          ? "Use standard capture"
+          : nil,
+        alternative: model.captureSessionMode == .experimentalARKit
+          ? { model.setCaptureSessionMode(.standard) }
+          : nil
+      )
     }
   }
 }
@@ -188,43 +228,49 @@ private struct CaptureScreen: View {
 
   /// Top-left mode selector at the beginning of capture
   private var primaryHeaderBar: some View {
-    HStack {
-      Menu {
-        Picker("Mode", selection: Binding(
-          get: { model.cameraMode },
-          set: { newMode in
-            withAnimation(.easeInOut(duration: 0.2)) {
-              model.setCameraMode(newMode)
+      HStack {
+        Menu {
+          Picker("Mode", selection: Binding(
+            get: { model.cameraMode },
+            set: { newMode in
+              withAnimation(.easeInOut(duration: 0.2)) {
+                model.setCameraMode(newMode)
+              }
+            }
+          )) {
+            ForEach(CameraMode.allCases, id: \.self) { mode in
+              Label(
+                mode.rawValue,
+                systemImage: mode == .auto ? "camera.aperture" : "slider.horizontal.3"
+              )
+              .tag(mode)
             }
           }
-        )) {
-          ForEach(CameraMode.allCases, id: \.self) { mode in
-            Label(
-              mode.rawValue,
-              systemImage: mode == .auto ? "camera.aperture" : "slider.horizontal.3"
-            )
-            .tag(mode)
+        } label: {
+          HStack(spacing: 6) {
+            Image(systemName: model.cameraMode == .auto ? "camera.aperture" : "slider.horizontal.3")
+              .font(.subheadline.weight(.semibold))
+            Text(model.cameraMode.rawValue)
+              .font(.subheadline.weight(.semibold))
+            Image(systemName: "chevron.down")
+              .font(.caption2.weight(.bold))
           }
+          .foregroundStyle(.white)
+          .padding(.horizontal, 14)
+          .padding(.vertical, 8)
+          .liquidGlassInteractive(in: Capsule())
         }
-      } label: {
-        HStack(spacing: 6) {
-          Image(systemName: model.cameraMode == .auto ? "camera.aperture" : "slider.horizontal.3")
-            .font(.subheadline.weight(.semibold))
-          Text(model.cameraMode.rawValue)
-            .font(.subheadline.weight(.semibold))
-          Image(systemName: "chevron.down")
-            .font(.caption2.weight(.bold))
-        }
-        .foregroundStyle(.white)
-        .padding(.horizontal, 14)
-        .padding(.vertical, 8)
-        .liquidGlassInteractive(in: Capsule())
-      }
-      .contentShape(Capsule())
-      .frame(minHeight: 44)
+        .contentShape(Capsule())
+        .frame(minHeight: 44)
 
-      Spacer()
-    }
+        Spacer()
+
+        CaptureSessionModeSwitch(
+          mode: model.displayedCaptureSessionMode,
+          isEnabled: !model.isCapturingPhoto && !model.isSwitchingCaptureSessionMode,
+          onSelect: { model.setCaptureSessionMode($0) }
+        )
+      }
     .padding(.horizontal, 16)
     .padding(.top, 4)
   }
@@ -248,6 +294,11 @@ private struct CaptureScreen: View {
           }
         }
         Spacer()
+        CaptureSessionModeSwitch(
+          mode: model.displayedCaptureSessionMode,
+          isEnabled: !model.isCapturingPhoto && !model.isSwitchingCaptureSessionMode,
+          onSelect: { model.setCaptureSessionMode($0) }
+        )
         Button("Reset") {
           model.resetCapture()
         }
@@ -710,76 +761,6 @@ private struct AppleCameraDialPanel: View {
   }
 }
 
-private struct CaptureSegmentProgress: View {
-  let total: Int
-  let capturedCount: Int
-
-  var body: some View {
-    HStack(spacing: 3) {
-      ForEach(0..<max(total, 0), id: \.self) { index in
-        segment(at: index)
-      }
-    }
-    .frame(height: 8)
-    .accessibilityElement(children: .ignore)
-    .accessibilityLabel("Capture progress, \(capturedCount) of \(total) photos")
-  }
-
-  private func segment(at index: Int) -> some View {
-    let captured = index < capturedCount
-    let current = index == capturedCount
-    let shape = RoundedRectangle(cornerRadius: 2.5, style: .continuous)
-    return shape
-      .fill(captured ? Color.blue : Color.clear)
-      .overlay {
-        shape.strokeBorder(
-          current ? Color.white : Color.white.opacity(captured ? 0 : 0.28),
-          lineWidth: current ? 1.6 : 1
-        )
-      }
-      .frame(maxWidth: .infinity)
-      .animation(.easeInOut(duration: 0.2), value: captured)
-      .animation(.easeInOut(duration: 0.2), value: current)
-  }
-}
-
-private struct ElasticGlassCaptureButtonStyle: ButtonStyle {
-  func makeBody(configuration: Configuration) -> some View {
-    configuration.label
-      .scaleEffect(configuration.isPressed ? 0.84 : 1)
-      .animation(
-        .spring(response: 0.26, dampingFraction: 0.48, blendDuration: 0),
-        value: configuration.isPressed
-      )
-  }
-}
-
-extension ButtonStyle where Self == ElasticGlassCaptureButtonStyle {
-  fileprivate static var elasticGlassCapture: ElasticGlassCaptureButtonStyle {
-    ElasticGlassCaptureButtonStyle()
-  }
-}
-
-private struct GlassStopButtonStyle: ButtonStyle {
-  func makeBody(configuration: Configuration) -> some View {
-    configuration.label
-      .font(.subheadline.weight(.semibold))
-      .padding(.horizontal, 14)
-      .padding(.vertical, 8)
-      .liquidGlassInteractive(in: Capsule())
-      .scaleEffect(configuration.isPressed ? 0.94 : 1)
-      .opacity(configuration.isPressed ? 0.8 : 1)
-      .animation(
-        .spring(response: 0.28, dampingFraction: 0.55),
-        value: configuration.isPressed
-      )
-  }
-}
-
-extension ButtonStyle where Self == GlassStopButtonStyle {
-  fileprivate static var glassStop: GlassStopButtonStyle { GlassStopButtonStyle() }
-}
-
 private struct SavedCaptureView: View {
   let package: CapturePackage
   @ObservedObject var model: CaptureViewModel
@@ -893,7 +874,9 @@ private struct StatusView: View {
 
 private struct FailureView: View {
   let message: String
-  let dismiss: () -> Void
+  let retry: () -> Void
+  var alternativeTitle: String? = nil
+  var alternative: (() -> Void)? = nil
 
   var body: some View {
     VStack(spacing: 16) {
@@ -905,8 +888,12 @@ private struct FailureView: View {
       Text(message)
         .multilineTextAlignment(.center)
         .foregroundStyle(.secondary)
-      Button("Try again", action: dismiss)
+      Button("Try again", action: retry)
         .buttonStyle(.borderedProminent)
+      if let alternativeTitle, let alternative {
+        Button(alternativeTitle, action: alternative)
+          .buttonStyle(.bordered)
+      }
     }
     .padding(30)
   }

@@ -160,6 +160,20 @@ final class CameraCaptureService: ObservableObject {
     stopSessionIfRunning()
   }
 
+  func stopAndWait() async {
+    sessionEpoch += 1
+    state = .idle
+    isFeedActive = false
+    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+      sessionQueue.async { [session] in
+        if session.isRunning {
+          session.stopRunning()
+        }
+        continuation.resume()
+      }
+    }
+  }
+
   func queryCapabilities() -> CameraManualControlCapabilities? {
     guard let device = captureDevice else { return nil }
     let format = device.activeFormat

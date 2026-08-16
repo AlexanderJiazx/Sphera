@@ -1029,4 +1029,566 @@ func captureConfigurationPersistence() throws {
   #expect(decoded.upwardCount == 5)
 }
 
+@Test("Experimental panorama configuration defaults to 16+12+12")
+func experimentalPanoramaConfigurationDefaults() {
+  let config = ExperimentalPanoramaConfiguration.default
+  #expect(config.horizontalImageCount == 16)
+  #expect(config.upwardImageCount == 12)
+  #expect(config.downwardImageCount == 12)
+  #expect(config.totalImageCount == 40)
+  #expect(config.scanLineOrder == [.horizontal, .upward, .downward])
+  #expect(config.yawStepDegrees(for: .horizontal) == 22.5)
+  #expect(config.targetYawOffsetDegrees(for: .horizontal, index: 0) == 0)
+  #expect(config.targetYawOffsetDegrees(for: .horizontal, index: 15) == 337.5)
+}
+
+@Test("Experimental pose math uses gravity-yaw with identity looking along -Z")
+func experimentalPoseMathIdentityHeading() {
+  let identity = matrix_identity_float4x4
+  let yawPitch = ExperimentalPoseMath.yawPitchDegrees(cameraToWorld: identity)
+  #expect(abs(yawPitch.yaw) < 0.001)
+  #expect(abs(yawPitch.pitch) < 0.001)
+  let look = ExperimentalPoseMath.lookDirection(cameraToWorld: identity)
+  #expect(abs(Double(look.z) + 1) < 0.001)
+}
+
+@Test("Experimental scan progressor captures on angular steps, not time")
+func experimentalScanProgressorUsesAngularSteps() {
+  var config = ExperimentalPanoramaConfiguration.default
+  config.horizontalImageCount = 4
+  config.scanRangeDegrees = 360
+  config.yawSmoothingAlpha = 1
+  config.captureHysteresisDegrees = 0.5
+  config.wrongDirectionDegrees = 18
+  var progressor = ExperimentalScanProgressor(configuration: config)
+  progressor.beginLine(.horizontal, currentYawDegrees: 10)
+
+  let first = progressor.update(makeScanSample(yaw: 10, timestamp: 1))
+  #expect(first.captureIndex == 0)
+  progressor.noteCaptureFinished(success: true)
+
+  let samePlaceLater = progressor.update(makeScanSample(yaw: 10.2, timestamp: 30))
+  #expect(samePlaceLater.captureIndex == nil)
+
+  let second = progressor.update(makeScanSample(yaw: 100, timestamp: 31))
+  #expect(second.captureIndex == 1)
+  #expect(abs(second.yawOffsetDegrees - 90) < 0.01)
+  progressor.noteCaptureFinished(success: true)
+
+  let duplicate = progressor.update(makeScanSample(yaw: 100.4, timestamp: 31.2))
+  #expect(duplicate.captureIndex == nil)
+}
+
+@Test("Experimental scan progressor unwraps yaw across the 180 boundary")
+func experimentalScanProgressorUnwrapsYaw() {
+  var config = ExperimentalPanoramaConfiguration.default
+  config.horizontalImageCount = 8
+  config.yawSmoothingAlpha = 1
+  config.captureHysteresisDegrees = 0.5
+  var progressor = ExperimentalScanProgressor(configuration: config)
+  progressor.beginLine(.horizontal, currentYawDegrees: 170)
+  let first = progressor.update(makeScanSample(yaw: 170, timestamp: 1))
+  #expect(first.captureIndex == 0)
+  progressor.noteCaptureFinished(success: true)
+
+  let wrapped = progressor.update(makeScanSample(yaw: -145, timestamp: 2))
+  #expect(abs(wrapped.yawOffsetDegrees - 45) < 0.5)
+  #expect(wrapped.captureIndex == 1)
+}
+
+@Test("Experimental scan progressor warns on reverse rotation and skips capture")
+func experimentalScanProgressorWrongDirection() {
+  var config = ExperimentalPanoramaConfiguration.default
+  config.horizontalImageCount = 8
+  config.yawSmoothingAlpha = 1
+  config.captureDirection = .clockwise
+  config.wrongDirectionDegrees = 6
+  var progressor = ExperimentalScanProgressor(configuration: config)
+  progressor.beginLine(.horizontal, currentYawDegrees: 0)
+  _ = progressor.update(makeScanSample(yaw: 0, timestamp: 1))
+  progressor.noteCaptureFinished(success: true)
+
+  let reverse = progressor.update(makeScanSample(yaw: -20, timestamp: 2))
+  #expect(reverse.isWrongDirection)
+  #expect(reverse.captureIndex == nil)
+  #expect(reverse.lockedDirection == .clockwise)
+}
+
+@Test("Experimental scan progressor locks counterclockwise and captures along that rotation")
+func experimentalScanProgressorLocksCounterclockwise() {
+  var config = ExperimentalPanoramaConfiguration.default
+  config.horizontalImageCount = 4
+  config.scanRangeDegrees = 360
+  config.yawSmoothingAlpha = 1
+  config.captureHysteresisDegrees = 0.5
+  config.captureDirection = .automatic
+  var progressor = ExperimentalScanProgressor(configuration: config)
+  progressor.beginLine(.horizontal, currentYawDegrees: 0)
+  let first = progressor.update(makeScanSample(yaw: 0, timestamp: 1))
+  #expect(first.captureIndex == 0)
+  progressor.noteCaptureFinished(success: true)
+
+  let second = progressor.update(makeScanSample(yaw: -90, timestamp: 2))
+  #expect(second.lockedDirection == .counterclockwise)
+  #expect(second.captureIndex == 1)
+  #expect(!second.isWrongDirection)
+}
+
+@Test("Experimental scan progressor blocks clockwise-then-reverse rotation")
+func experimentalScanProgressorBlocksReverseAfterLock() {
+  var config = ExperimentalPanoramaConfiguration.default
+  config.horizontalImageCount = 4
+  config.scanRangeDegrees = 360
+  config.yawSmoothingAlpha = 1
+  config.captureHysteresisDegrees = 0.5
+  config.captureDirection = .automatic
+  config.wrongDirectionDegrees = 6
+  var progressor = ExperimentalScanProgressor(configuration: config)
+  progressor.beginLine(.horizontal, currentYawDegrees: 0)
+  _ = progressor.update(makeScanSample(yaw: 0, timestamp: 1))
+  progressor.noteCaptureFinished(success: true)
+
+  let forward = progressor.update(makeScanSample(yaw: 40, timestamp: 2))
+  #expect(forward.lockedDirection == .clockwise)
+  #expect(forward.captureIndex == nil)
+  progressor.noteCaptureFinished(success: true)
+
+  let reverse = progressor.update(makeScanSample(yaw: 20, timestamp: 3))
+  #expect(reverse.isWrongDirection)
+  #expect(reverse.captureIndex == nil)
+}
+
+@Test("Experimental scan progressor defers capture when pitch error is too large")
+func experimentalScanProgressorDefersOffPathPitch() {
+  var config = ExperimentalPanoramaConfiguration.default
+  config.horizontalImageCount = 4
+  config.scanRangeDegrees = 360
+  config.yawSmoothingAlpha = 1
+  config.captureHysteresisDegrees = 0.5
+  config.maxPitchErrorForCaptureDegrees = 5
+  config.captureDirection = .clockwise
+  var progressor = ExperimentalScanProgressor(configuration: config)
+  progressor.beginLine(.horizontal, currentYawDegrees: 0)
+  _ = progressor.update(makeScanSample(yaw: 0, pitch: 0, timestamp: 1))
+  progressor.noteCaptureFinished(success: true)
+
+  let offPath = progressor.update(makeScanSample(yaw: 90, pitch: 12, timestamp: 2))
+  #expect(offPath.captureIndex == nil)
+  #expect(offPath.isAbovePath)
+  #expect(offPath.qualityNotes.contains("off-path-pitch"))
+
+  let onPath = progressor.update(makeScanSample(yaw: 90, pitch: 1, timestamp: 3))
+  #expect(onPath.captureIndex == 1)
+}
+
+@Test("Pitch and roll warnings use the same threshold as the capture gate")
+func experimentalWarningMatchesCaptureGate() {
+  var config = ExperimentalPanoramaConfiguration.default
+  config.horizontalImageCount = 4
+  config.scanRangeDegrees = 360
+  config.yawSmoothingAlpha = 1
+  config.captureHysteresisDegrees = 0.5
+  config.maxPitchErrorForCaptureDegrees = 4
+  config.pathDriftWarningDegrees = 2
+  config.maxRollForCaptureDegrees = 4
+  config.rollWarningDegrees = 2.5
+  config.captureDirection = .clockwise
+
+  var pitchProgressor = ExperimentalScanProgressor(configuration: config)
+  pitchProgressor.beginLine(.horizontal, currentYawDegrees: 0)
+  _ = pitchProgressor.update(makeScanSample(yaw: 0, timestamp: 1))
+  pitchProgressor.noteCaptureFinished(success: true)
+
+  let pitchInside = pitchProgressor.update(makeScanSample(yaw: 90, pitch: 3.5, timestamp: 2))
+  #expect(pitchInside.captureIndex == 1)
+  #expect(!pitchInside.isAbovePath)
+  #expect(!pitchInside.qualityNotes.contains("off-path-pitch"))
+
+  var pitchBlocked = ExperimentalScanProgressor(configuration: config)
+  pitchBlocked.beginLine(.horizontal, currentYawDegrees: 0)
+  _ = pitchBlocked.update(makeScanSample(yaw: 0, timestamp: 1))
+  pitchBlocked.noteCaptureFinished(success: true)
+  let pitchOutside = pitchBlocked.update(makeScanSample(yaw: 90, pitch: 4.5, timestamp: 2))
+  #expect(pitchOutside.captureIndex == nil)
+  #expect(pitchOutside.isAbovePath)
+  #expect(pitchOutside.qualityNotes.contains("off-path-pitch"))
+
+  var rollProgressor = ExperimentalScanProgressor(configuration: config)
+  rollProgressor.beginLine(.horizontal, currentYawDegrees: 0)
+  _ = rollProgressor.update(makeScanSample(yaw: 0, timestamp: 1))
+  rollProgressor.noteCaptureFinished(success: true)
+  let rollInside = rollProgressor.update(makeScanSample(yaw: 90, roll: 3.5, timestamp: 2))
+  #expect(rollInside.captureIndex == 1)
+  #expect(!rollInside.isRolled)
+  #expect(!rollInside.qualityNotes.contains("off-upright-roll"))
+
+  var rollBlocked = ExperimentalScanProgressor(configuration: config)
+  rollBlocked.beginLine(.horizontal, currentYawDegrees: 0)
+  _ = rollBlocked.update(makeScanSample(yaw: 0, timestamp: 1))
+  rollBlocked.noteCaptureFinished(success: true)
+  let rollOutside = rollBlocked.update(makeScanSample(yaw: 90, roll: 4.5, timestamp: 2))
+  #expect(rollOutside.captureIndex == nil)
+  #expect(rollOutside.isRolled)
+  #expect(rollOutside.qualityNotes.contains("off-upright-roll"))
+}
+
+@Test("Pointing at the sky does not capture even after yaw overshoots a target")
+func experimentalScanProgressorNeverCapturesSkyAim() {
+  var config = ExperimentalPanoramaConfiguration.default
+  config.horizontalImageCount = 16
+  config.scanRangeDegrees = 360
+  config.yawSmoothingAlpha = 1
+  config.captureHysteresisDegrees = 0.5
+  config.maxPitchErrorForCaptureDegrees = 4
+  config.captureDirection = .clockwise
+  var progressor = ExperimentalScanProgressor(configuration: config)
+  progressor.beginLine(.horizontal, currentYawDegrees: 0)
+  _ = progressor.update(makeScanSample(yaw: 0, pitch: 0, timestamp: 1))
+  progressor.noteCaptureFinished(success: true)
+
+  let skyAim = progressor.update(makeScanSample(yaw: 40, pitch: 88, timestamp: 2))
+  #expect(skyAim.captureIndex == nil)
+  #expect(skyAim.isAbovePath)
+  #expect(skyAim.qualityNotes.contains("off-path-pitch"))
+}
+
+@Test("Screen-plane roll blocks capture and reports an upright warning")
+func experimentalScanProgressorBlocksScreenPlaneRoll() {
+  var config = ExperimentalPanoramaConfiguration.default
+  config.horizontalImageCount = 4
+  config.scanRangeDegrees = 360
+  config.yawSmoothingAlpha = 1
+  config.captureHysteresisDegrees = 0.5
+  config.maxRollForCaptureDegrees = 4
+  config.rollWarningDegrees = 2.5
+  config.captureDirection = .clockwise
+  var progressor = ExperimentalScanProgressor(configuration: config)
+  progressor.beginLine(.horizontal, currentYawDegrees: 0)
+  _ = progressor.update(makeScanSample(yaw: 0, timestamp: 1))
+  progressor.noteCaptureFinished(success: true)
+
+  let rolled = progressor.update(makeScanSample(yaw: 90, roll: 25, timestamp: 2))
+  #expect(rolled.captureIndex == nil)
+  #expect(rolled.isRolled)
+  #expect(rolled.qualityNotes.contains("off-upright-roll"))
+
+  let upright = progressor.update(makeScanSample(yaw: 90, roll: 1, timestamp: 3))
+  #expect(upright.captureIndex == 1)
+  #expect(!upright.isRolled)
+}
+
+@Test("Screen-plane roll is zero when upright and follows steering-wheel rotation")
+func experimentalScreenPlaneRollFromGravity() {
+  let upright = Vector3Value(x: 0, y: -1, z: 0)
+  #expect(abs(ExperimentalPoseMath.screenPlaneRollDegrees(gravityDevice: upright)) < 0.001)
+  #expect(abs(ExperimentalPoseMath.cameraElevationDegrees(gravityDevice: upright)) < 0.001)
+
+  let clockwise = Vector3Value(x: 1, y: 0, z: 0)
+  #expect(abs(ExperimentalPoseMath.screenPlaneRollDegrees(gravityDevice: clockwise) - 90) < 0.001)
+
+  let counterclockwise = Vector3Value(x: -1, y: 0, z: 0)
+  #expect(abs(ExperimentalPoseMath.screenPlaneRollDegrees(gravityDevice: counterclockwise) + 90) < 0.001)
+
+  let sky = Vector3Value(x: 0, y: 0, z: 1)
+  #expect(abs(ExperimentalPoseMath.cameraElevationDegrees(gravityDevice: sky) - 90) < 0.001)
+  #expect(!ExperimentalPoseMath.isScreenPlaneRollDefined(gravityDevice: sky))
+}
+
+@Test("Attitude gate uses the pitch sensor farther from the scan line")
+func experimentalAttitudeGatePrefersWorsePitchSensor() {
+  var config = ExperimentalPanoramaConfiguration.default
+  config.maxPitchErrorForCaptureDegrees = 4
+  config.maxRollForCaptureDegrees = 4
+  let skyGravity = Vector3Value(x: 0, y: 0, z: 1)
+  let hiddenByARKit = ExperimentalAttitudeReading.make(
+    gravity: skyGravity,
+    arkitPitchDegrees: 0,
+    targetPitchDegrees: 0,
+    configuration: config
+  )
+  #expect(hiddenByARKit.isPitchBlockingCapture)
+  #expect(abs(hiddenByARKit.pitchDegrees - 90) < 1)
+
+  let rolled = ExperimentalAttitudeReading.make(
+    gravity: Vector3Value(x: 0.5, y: -0.866, z: 0),
+    arkitPitchDegrees: 0,
+    targetPitchDegrees: 0,
+    configuration: config
+  )
+  #expect(abs(rolled.rollDegrees - 30) < 1)
+  #expect(rolled.isRolled)
+  #expect(rolled.isRollBlockingCapture)
+  #expect(rolled.primaryWarning != nil)
+}
+
+@Test("Path arrow moves down when the phone aims below the line")
+func experimentalArrowOffsetMatchesPhonePitch() {
+  let below = ExperimentalPoseMath.arrowScreenYOffset(pitchErrorDegrees: -5)
+  let above = ExperimentalPoseMath.arrowScreenYOffset(pitchErrorDegrees: 5)
+  #expect(below > 0)
+  #expect(above < 0)
+  #expect(abs(below + above) < 0.001)
+}
+
+@Test("Experimental scan progressor completes a line after the configured count")
+func experimentalScanProgressorCompletesLine() {
+  var config = ExperimentalPanoramaConfiguration.default
+  config.horizontalImageCount = 3
+  config.scanRangeDegrees = 360
+  config.yawSmoothingAlpha = 1
+  config.captureHysteresisDegrees = 0.5
+  var progressor = ExperimentalScanProgressor(configuration: config)
+  progressor.beginLine(.horizontal, currentYawDegrees: 0)
+
+  for index in 0..<3 {
+    let yaw = Double(index) * 120
+    let update = progressor.update(makeScanSample(yaw: yaw, timestamp: Double(index)))
+    #expect(update.captureIndex == index)
+    progressor.noteCaptureFinished(success: true)
+  }
+  let done = progressor.update(makeScanSample(yaw: 240, timestamp: 4))
+  #expect(done.isLineComplete)
+  #expect(done.captureIndex == nil)
+  #expect(done.capturedCount == 3)
+}
+
+@Test("Experimental packages associate images by stable filename and id")
+func experimentalPackagePersistsStableImageIDs() async throws {
+  let root = FileManager.default.temporaryDirectory
+    .appendingPathComponent("SpheraARKitTests-\(UUID().uuidString)", isDirectory: true)
+  defer { try? FileManager.default.removeItem(at: root) }
+
+  var config = ExperimentalPanoramaConfiguration.default
+  config.horizontalImageCount = 2
+  config.upwardImageCount = 0
+  config.downwardImageCount = 0
+  let store = ExperimentalCapturePackageStore(sessionsRootURL: root)
+  _ = try await store.begin(configuration: config, coreMotionReferenceFrame: "test-frame")
+  try await store.recordSessionStart(
+    transform: Matrix4x4Value(matrix_identity_float4x4),
+    timestamp: 1
+  )
+
+  let firstID = UUID()
+  let secondID = UUID()
+  let first = try await store.append(
+    imageData: Data([0xff, 0xd8, 0xff, 0xd9]),
+    frameID: firstID,
+    scanLine: .horizontal,
+    indexInLine: 0,
+    targetYawOffsetDegrees: 0,
+    actualYawOffsetDegrees: 0.4,
+    actualPitchDegrees: 1.2,
+    arkit: makeARKitMetadata(timestamp: 1),
+    motion: makeMotionSample(
+      quaternion: simd_quatd(angle: -.pi / 2, axis: SIMD3<Double>(1, 0, 0))
+    ),
+    photo: PhotoMetadata(
+      codec: "jpeg",
+      width: 1920,
+      height: 1440,
+      exifOrientation: 1,
+      exposureDurationSeconds: nil,
+      iso: nil,
+      aperture: nil,
+      focalLengthMillimeters: nil,
+      focalLength35mmEquivalent: nil,
+      brightnessValue: nil,
+      exposureBiasValue: nil,
+      lensMake: nil,
+      lensModel: nil
+    ),
+    qualityNotes: []
+  )
+  _ = try await store.append(
+    imageData: Data([0xff, 0xd8, 0xff, 0xd9]),
+    frameID: secondID,
+    scanLine: .horizontal,
+    indexInLine: 1,
+    targetYawOffsetDegrees: 180,
+    actualYawOffsetDegrees: 179.2,
+    actualPitchDegrees: -0.4,
+    arkit: makeARKitMetadata(timestamp: 2),
+    motion: makeMotionSample(
+      quaternion: simd_quatd(angle: -.pi / 2, axis: SIMD3<Double>(1, 0, 0))
+    ),
+    photo: PhotoMetadata(
+      codec: "jpeg",
+      width: 1920,
+      height: 1440,
+      exifOrientation: 1,
+      exposureDurationSeconds: nil,
+      iso: nil,
+      aperture: nil,
+      focalLengthMillimeters: nil,
+      focalLength35mmEquivalent: nil,
+      brightnessValue: nil,
+      exposureBiasValue: nil,
+      lensMake: nil,
+      lensModel: nil
+    ),
+    qualityNotes: []
+  )
+
+  let package = try await store.finalize()
+  #expect(package.manifest.kind == ExperimentalCaptureManifest.kindIdentifier)
+  #expect(package.manifest.isComplete)
+  #expect(package.manifest.frames.count == 2)
+  #expect(package.manifest.frames[0].id == firstID)
+  #expect(package.manifest.frames[0].imageFilename.contains(firstID.uuidString))
+  #expect(package.manifest.frames[0].scanLine == .horizontal)
+  #expect(package.manifest.frames[1].id == secondID)
+  #expect(first.imageFilename.hasPrefix("horizontal_00_"))
+  #expect(FileManager.default.fileExists(atPath: package.imageURL(for: first.imageFilename).path))
+}
+
+@Test("Experimental share archive includes ARKit sidecars and not the current engine request")
+func experimentalShareArchiveContainsARKitMetadata() async throws {
+  let root = FileManager.default.temporaryDirectory
+    .appendingPathComponent("SpheraARKitShareTests-\(UUID().uuidString)", isDirectory: true)
+  defer { try? FileManager.default.removeItem(at: root) }
+
+  var config = ExperimentalPanoramaConfiguration.default
+  config.horizontalImageCount = 1
+  config.upwardImageCount = 0
+  config.downwardImageCount = 0
+  let store = ExperimentalCapturePackageStore(sessionsRootURL: root)
+  _ = try await store.begin(configuration: config, coreMotionReferenceFrame: "test-frame")
+  let frameID = UUID()
+  _ = try await store.append(
+    imageData: Data([0xff, 0xd8, 0xff, 0xd9]),
+    frameID: frameID,
+    scanLine: .horizontal,
+    indexInLine: 0,
+    targetYawOffsetDegrees: 0,
+    actualYawOffsetDegrees: 0,
+    actualPitchDegrees: 0,
+    arkit: makeARKitMetadata(timestamp: 1),
+    motion: makeMotionSample(
+      quaternion: simd_quatd(angle: -.pi / 2, axis: SIMD3<Double>(1, 0, 0))
+    ),
+    photo: PhotoMetadata(
+      codec: "jpeg",
+      width: 1920,
+      height: 1440,
+      exifOrientation: 1,
+      exposureDurationSeconds: nil,
+      iso: nil,
+      aperture: nil,
+      focalLengthMillimeters: nil,
+      focalLength35mmEquivalent: nil,
+      brightnessValue: nil,
+      exposureBiasValue: nil,
+      lensMake: nil,
+      lensModel: nil
+    ),
+    qualityNotes: []
+  )
+  let package = try await store.finalize()
+  let zipURL = try await store.makeShareArchive(for: package)
+  let zipText = String(decoding: try Data(contentsOf: zipURL), as: UTF8.self)
+  #expect(zipText.contains("manifest.json"))
+  #expect(zipText.contains("ARKIT_EXPERIMENTAL_NOTES.md"))
+  #expect(zipText.contains("metadata/"))
+  #expect(zipText.contains(frameID.uuidString))
+  #expect(!zipText.contains("sphera-engine-request.json"))
+}
+
+@Test("Experimental ARKit JPEGs are tagged for locked-portrait display")
+func experimentalARKitJPEGUsesPortraitEXIFOrientation() {
+  #expect(ExperimentalCaptureImage.jpegEXIFOrientation == 6)
+  let photo = PhotoMetadata(
+    codec: "jpeg",
+    width: 1920,
+    height: 1440,
+    exifOrientation: ExperimentalCaptureImage.jpegEXIFOrientation,
+    exposureDurationSeconds: nil,
+    iso: nil,
+    aperture: nil,
+    focalLengthMillimeters: nil,
+    focalLength35mmEquivalent: nil,
+    brightnessValue: nil,
+    exposureBiasValue: nil,
+    lensMake: nil,
+    lensModel: nil
+  )
+  #expect(photo.orientedPixelWidth == 1440)
+  #expect(photo.orientedPixelHeight == 1920)
+}
+
+@Test("Experimental packages record ARKit gravity as the motion reference")
+func experimentalPackageRecordsARKitGravityReference() async throws {
+  let root = FileManager.default.temporaryDirectory
+    .appendingPathComponent("SpheraARKitRef-\(UUID().uuidString)", isDirectory: true)
+  defer { try? FileManager.default.removeItem(at: root) }
+
+  var config = ExperimentalPanoramaConfiguration.default
+  config.horizontalImageCount = 1
+  config.upwardImageCount = 0
+  config.downwardImageCount = 0
+  let store = ExperimentalCapturePackageStore(sessionsRootURL: root)
+  let started = try await store.begin(
+    configuration: config,
+    coreMotionReferenceFrame: ExperimentalCaptureManifest.worldTrackingReferenceFrame
+  )
+  #expect(started.manifest.coreMotionReferenceFrame == "arkitGravity")
+  #expect(
+    started.manifest.coreMotionReferenceFrame
+      == ExperimentalCaptureManifest.worldTrackingReferenceFrame
+  )
+}
+
+@Test("Incomplete experimental sessions are not listed")
+func experimentalIncompleteSessionsAreCleanedUp() async throws {
+  let root = FileManager.default.temporaryDirectory
+    .appendingPathComponent("SpheraARKitCleanup-\(UUID().uuidString)", isDirectory: true)
+  defer { try? FileManager.default.removeItem(at: root) }
+
+  var config = ExperimentalPanoramaConfiguration.default
+  config.horizontalImageCount = 2
+  config.upwardImageCount = 0
+  config.downwardImageCount = 0
+  let store = ExperimentalCapturePackageStore(sessionsRootURL: root)
+  _ = try await store.begin(configuration: config, coreMotionReferenceFrame: "test-frame")
+  await store.abandon()
+  let listed = try await store.listCompletedPackages()
+  #expect(listed.isEmpty)
+}
+
+private func makeScanSample(
+  yaw: Double,
+  pitch: Double = 0,
+  roll: Double = 0,
+  timestamp: TimeInterval,
+  quality: ExperimentalTrackingQuality = .normal
+) -> ExperimentalScanSample {
+  ExperimentalScanSample(
+    yawDegrees: yaw,
+    pitchDegrees: pitch,
+    rollDegrees: roll,
+    timestamp: timestamp,
+    trackingQuality: quality,
+    rotationRateMagnitude: 0,
+    translationMeters: 0
+  )
+}
+
+private func makeARKitMetadata(timestamp: TimeInterval) -> ARKitCameraMetadata {
+  let transform = matrix_identity_float4x4
+  return ARKitCameraMetadata(
+    timestamp: timestamp,
+    trackingState: .normal,
+    transform: Matrix4x4Value(transform),
+    intrinsics: Matrix3x3Value(matrix_identity_float3x3),
+    imageResolutionWidth: 1920,
+    imageResolutionHeight: 1440,
+    position: Vector3Value(x: 0, y: 0, z: 0),
+    orientation: QuaternionValue(w: 1, x: 0, y: 0, z: 0),
+    translationFromSessionStart: Vector3Value(x: 0, y: 0, z: 0),
+    rotationFromSessionStart: QuaternionValue(w: 1, x: 0, y: 0, z: 0),
+    relativeTransform: Matrix4x4Value(transform),
+    eulerDegrees: Vector3Value(x: 0, y: 0, z: 0)
+  )
+}
+
 

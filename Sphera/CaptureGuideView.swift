@@ -222,3 +222,73 @@ struct GlassRingShape: Shape {
     return path
   }
 }
+
+struct CaptureSegmentProgress: View {
+  let total: Int
+  let capturedCount: Int
+
+  var body: some View {
+    HStack(spacing: 3) {
+      ForEach(0..<max(total, 0), id: \.self) { index in
+        segment(at: index)
+      }
+    }
+    .frame(height: 8)
+    .accessibilityElement(children: .ignore)
+    .accessibilityLabel("Capture progress, \(capturedCount) of \(total) photos")
+  }
+
+  private func segment(at index: Int) -> some View {
+    let captured = index < capturedCount
+    let current = index == capturedCount
+    let shape = RoundedRectangle(cornerRadius: 2.5, style: .continuous)
+    return shape
+      .fill(captured ? Color.blue : Color.clear)
+      .overlay {
+        shape.strokeBorder(
+          current ? Color.white : Color.white.opacity(captured ? 0 : 0.28),
+          lineWidth: current ? 1.6 : 1
+        )
+      }
+      .frame(maxWidth: .infinity)
+      .animation(.easeInOut(duration: 0.2), value: captured)
+      .animation(.easeInOut(duration: 0.2), value: current)
+  }
+}
+
+struct ElasticGlassCaptureButtonStyle: ButtonStyle {
+  func makeBody(configuration: Configuration) -> some View {
+    configuration.label
+      .scaleEffect(configuration.isPressed ? 0.84 : 1)
+      .animation(
+        .spring(response: 0.26, dampingFraction: 0.48, blendDuration: 0),
+        value: configuration.isPressed
+      )
+  }
+}
+
+extension ButtonStyle where Self == ElasticGlassCaptureButtonStyle {
+  static var elasticGlassCapture: ElasticGlassCaptureButtonStyle {
+    ElasticGlassCaptureButtonStyle()
+  }
+}
+
+struct GlassStopButtonStyle: ButtonStyle {
+  func makeBody(configuration: Configuration) -> some View {
+    configuration.label
+      .font(.subheadline.weight(.semibold))
+      .padding(.horizontal, 14)
+      .padding(.vertical, 8)
+      .liquidGlassInteractive(in: Capsule())
+      .scaleEffect(configuration.isPressed ? 0.94 : 1)
+      .opacity(configuration.isPressed ? 0.8 : 1)
+      .animation(
+        .spring(response: 0.28, dampingFraction: 0.55),
+        value: configuration.isPressed
+      )
+  }
+}
+
+extension ButtonStyle where Self == GlassStopButtonStyle {
+  static var glassStop: GlassStopButtonStyle { GlassStopButtonStyle() }
+}

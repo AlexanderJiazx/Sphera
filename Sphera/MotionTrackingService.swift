@@ -81,8 +81,14 @@ final class MotionTrackingService: ObservableObject {
     }
   }
 
+  var isRunning: Bool {
+    motionManager.isDeviceMotionActive
+  }
+
   func stop() {
     motionManager.stopDeviceMotionUpdates()
+    sampleStore.clear()
+    currentSample = nil
   }
 
   func waitForFirstSample(timeoutSeconds: Double = 3) async throws -> MotionSample {

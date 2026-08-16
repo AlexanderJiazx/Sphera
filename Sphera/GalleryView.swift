@@ -16,9 +16,9 @@ struct GalleryView: View {
 
   var body: some View {
     Group {
-      if model.isRefreshingGallery && model.galleryPackages.isEmpty {
+      if model.isRefreshingGallery && model.galleryItems.isEmpty {
         ProgressView("Loading gallery")
-      } else if model.galleryPackages.isEmpty {
+      } else if model.galleryItems.isEmpty {
         ContentUnavailableView(
           "No captures yet",
           systemImage: "photo.on.rectangle.angled",
@@ -27,16 +27,28 @@ struct GalleryView: View {
       } else {
         ScrollView {
           LazyVGrid(columns: columns, spacing: 12) {
-            ForEach(model.galleryPackages, id: \.manifest.sessionID) { package in
+            ForEach(model.galleryItems) { item in
               NavigationLink {
-                galleryDestination(for: package)
+                galleryDestination(for: item)
               } label: {
-                GalleryGridCard(package: package, zoomNamespace: galleryZoom)
+                switch item {
+                case .standard(let package):
+                  GalleryGridCard(package: package, zoomNamespace: galleryZoom)
+                case .experimental(let package):
+                  ExperimentalGalleryGridCard(package: package)
+                }
               }
               .buttonStyle(.plain)
               .contextMenu {
                 Button(role: .destructive) {
-                  Task { await model.deleteFromGallery(package) }
+                  Task {
+                    switch item {
+                    case .standard(let package):
+                      await model.deleteFromGallery(package)
+                    case .experimental(let package):
+                      await model.deleteFromGallery(package)
+                    }
+                  }
                 } label: {
                   Label("Delete", systemImage: "trash")
                 }
@@ -100,16 +112,25 @@ struct GalleryView: View {
   }
 
   @ViewBuilder
-  private func galleryDestination(for package: CapturePackage) -> some View {
-    if package.hasPanorama {
-      GalleryPanoramaView(
-        model: model,
-        package: package,
-        onShare: { await presentShare(for: package) }
-      )
-      .navigationTransition(.zoom(sourceID: package.manifest.sessionID, in: galleryZoom))
-    } else {
-      GalleryDetailView(
+  private func galleryDestination(for item: GalleryCaptureItem) -> some View {
+    switch item {
+    case .standard(let package):
+      if package.hasPanorama {
+        GalleryPanoramaView(
+          model: model,
+          package: package,
+          onShare: { await presentShare(for: package) }
+        )
+        .navigationTransition(.zoom(sourceID: package.manifest.sessionID, in: galleryZoom))
+      } else {
+        GalleryDetailView(
+          model: model,
+          package: package,
+          onShare: { await presentShare(for: package) }
+        )
+      }
+    case .experimental(let package):
+      ExperimentalGalleryDetailView(
         model: model,
         package: package,
         onShare: { await presentShare(for: package) }
@@ -119,6 +140,18 @@ struct GalleryView: View {
 
   @MainActor
   private func presentShare(for package: CapturePackage) async {
+    isPreparingShare = true
+    defer { isPreparingShare = false }
+    do {
+      let url = try await model.makeShareArchive(for: package)
+      sharePayload = SharePayload(url: url)
+    } catch {
+      shareErrorMessage = error.localizedDescription
+    }
+  }
+
+  @MainActor
+  private func presentShare(for package: ExperimentalCapturePackage) async {
     isPreparingShare = true
     defer { isPreparingShare = false }
     do {
@@ -511,6 +544,172 @@ struct GalleryDetailView: View {
 
   private func isJSONURL(_ url: URL) -> Bool {
     url.pathExtension.lowercased() == "json"
+  }
+}
+
+private struct ExperimentalGalleryGridCard: View {
+  let package: ExperimentalCapturePackage
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 0) {
+      thumbnail
+      VStack(alignment: .leading, spacing: 2) {
+        Text(package.manifest.completedAt ?? package.manifest.createdAt, format: .dateTime)
+          .font(.subheadline.weight(.semibold))
+          .lineLimit(1)
+        Text("\(package.manifest.frames.count) ARKit frames · Experimental")
+          .font(.caption)
+          .foregroundStyle(.secondary)
+          .lineLimit(1)
+      }
+      .padding(.top, 8)
+      .padding(.horizontal, 2)
+    }
+  }
+
+  @ViewBuilder
+  private var thumbnail: some View {
+    let shape = RoundedRectangle(cornerRadius: 14, style: .continuous)
+    preview
+      .frame(maxWidth: .infinity)
+      .aspectRatio(1, contentMode: .fit)
+      .clipShape(shape)
+      .overlay(alignment: .topTrailing) {
+        Text("ARKit")
+          .font(.caption2.weight(.bold))
+          .foregroundStyle(.black)
+          .padding(.horizontal, 7)
+          .padding(.vertical, 4)
+          .background(Color(red: 1, green: 0.72, blue: 0.12), in: Capsule())
+          .padding(8)
+      }
+      .overlay {
+        shape.strokeBorder(.white.opacity(0.12), lineWidth: 1)
+      }
+      .shadow(color: .black.opacity(0.35), radius: 8, y: 4)
+  }
+
+  @ViewBuilder
+  private var preview: some View {
+    if let url = package.previewImageURL,
+      let image = UIImage(contentsOfFile: url.path)
+    {
+      Image(uiImage: image)
+        .resizable()
+        .scaledToFill()
+        .frame(minWidth: 0, maxWidth: .infinity, minHeight: 0, maxHeight: .infinity)
+    } else {
+      ZStack {
+        Color.secondary.opacity(0.18)
+        Image(systemName: "move.3d")
+          .font(.title)
+          .foregroundStyle(.secondary)
+      }
+    }
+  }
+}
+
+struct ExperimentalGalleryDetailView: View {
+  @ObservedObject var model: CaptureViewModel
+  let package: ExperimentalCapturePackage
+  let onShare: () async -> Void
+
+  @Environment(\.dismiss) private var dismiss
+  @State private var isSharing = false
+
+  private var livePackage: ExperimentalCapturePackage {
+    model.experimentalGalleryPackages.first {
+      $0.manifest.sessionID == package.manifest.sessionID
+    } ?? package
+  }
+
+  var body: some View {
+    List {
+      Section {
+        if let url = livePackage.previewImageURL,
+          let image = UIImage(contentsOfFile: url.path)
+        {
+          Image(uiImage: image)
+            .resizable()
+            .scaledToFit()
+            .frame(maxWidth: .infinity)
+            .listRowInsets(EdgeInsets())
+        }
+      }
+
+      Section("Experimental ARKit capture") {
+        LabeledContent("Frames", value: "\(package.manifest.frames.count)")
+        LabeledContent(
+          "Saved",
+          value: (package.manifest.completedAt ?? package.manifest.createdAt)
+            .formatted(date: .abbreviated, time: .shortened)
+        )
+        LabeledContent("Kind", value: package.manifest.kind)
+        LabeledContent("Complete", value: package.manifest.isComplete ? "Yes" : "No")
+        ForEach(package.manifest.lineSummaries, id: \.scanLine) { summary in
+          LabeledContent(
+            summary.scanLine.displayName,
+            value: "\(summary.capturedCount)/\(summary.imageCount)"
+          )
+        }
+      }
+
+      Section("Frames") {
+        ForEach(package.manifest.frames) { frame in
+          VStack(alignment: .leading, spacing: 4) {
+            Text(
+              "\(frame.sequenceIndex + 1). \(frame.scanLine.displayName) \(frame.indexInLine + 1)"
+            )
+            .font(.headline)
+            Text(frame.imageFilename)
+              .font(.caption2)
+              .foregroundStyle(.secondary)
+            Text(
+              "Yaw offset \(frame.actualYawOffsetDegrees, format: .number.precision(.fractionLength(1)))° · Pitch \(frame.actualPitchDegrees, format: .number.precision(.fractionLength(1)))°"
+            )
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            Text("Tracking \(frame.arkit.trackingState.displayName)")
+              .font(.caption2)
+              .foregroundStyle(.secondary)
+          }
+          .padding(.vertical, 2)
+        }
+      }
+
+      Section {
+        Button {
+          Task {
+            isSharing = true
+            await onShare()
+            isSharing = false
+          }
+        } label: {
+          Label(
+            isSharing ? "Preparing archive…" : "Share ARKit capture archive",
+            systemImage: "square.and.arrow.up"
+          )
+        }
+        .disabled(isSharing)
+
+        Button(role: .destructive) {
+          Task {
+            await model.deleteFromGallery(package)
+            dismiss()
+          }
+        } label: {
+          Label("Delete capture", systemImage: "trash")
+        }
+        .tint(.red)
+        .foregroundStyle(.red)
+      } footer: {
+        Text(
+          "This experimental dataset is for a future computer-side stitcher. The current on-device engine does not consume ARKit captures."
+        )
+      }
+    }
+    .navigationTitle("ARKit Capture")
+    .navigationBarTitleDisplayMode(.inline)
   }
 }
 

@@ -7,7 +7,10 @@ enum CaptureWorkflowPhase: Equatable {
   case preparing
   case awaitingPrimary
   case capturingPoints
+  case experimentalReady
+  case experimentalScanning
   case saved(CapturePackage)
+  case savedExperimental(ExperimentalCapturePackage)
   case stitching
   case failed(String)
 }
@@ -36,6 +39,7 @@ final class CaptureViewModel: ObservableObject {
   private static let downwardCountKey = "sphera.downwardCount"
   private static let upwardCountKey = "sphera.upwardCount"
   private static let cameraModeKey = "sphera.cameraMode"
+  private static let captureSessionModeKey = "sphera.captureSessionMode"
   private static let isShutterAutoKey = "sphera.isShutterAuto"
   private static let isISOAutoKey = "sphera.isISOAuto"
   private static let isFocusAutoKey = "sphera.isFocusAuto"
@@ -78,6 +82,12 @@ final class CaptureViewModel: ObservableObject {
     didSet {
       UserDefaults.standard.set(cameraMode.rawValue, forKey: Self.cameraModeKey)
       Task { await applyActiveCameraMode() }
+    }
+  }
+  @Published var captureSessionMode: CaptureSessionMode {
+    didSet {
+      guard !isUpdatingFromDefaults else { return }
+      UserDefaults.standard.set(captureSessionMode.rawValue, forKey: Self.captureSessionModeKey)
     }
   }
   @Published var isShutterAuto: Bool {
@@ -146,11 +156,19 @@ final class CaptureViewModel: ObservableObject {
   @Published private(set) var stitchProgress: Double?
   @Published private(set) var captureErrorMessage: String?
   @Published private(set) var galleryPackages: [CapturePackage] = []
+  @Published private(set) var experimentalGalleryPackages: [ExperimentalCapturePackage] = []
   @Published private(set) var galleryErrorMessage: String?
   @Published private(set) var isRefreshingGallery = false
+  @Published private(set) var isSwitchingCaptureSessionMode = false
+  @Published private(set) var pendingCaptureSessionMode: CaptureSessionMode?
+
+  var displayedCaptureSessionMode: CaptureSessionMode {
+    pendingCaptureSessionMode ?? captureSessionMode
+  }
 
   let motion: MotionTrackingService
   let camera: CameraCaptureService
+  let experimental: ExperimentalCaptureController
 
   private let packageStore: CapturePackageStore
   /// When set (tests), compute always uses this stitcher and ignores the toggle.
@@ -174,6 +192,7 @@ final class CaptureViewModel: ObservableObject {
   private let navigationTraceEnabled =
     ProcessInfo.processInfo.arguments.contains("--navigation-trace")
   private var isCaptureTabActive = false
+  private var captureGeneration = 0
 
   init(
     packageStore: CapturePackageStore = CapturePackageStore(),
@@ -186,6 +205,8 @@ final class CaptureViewModel: ObservableObject {
     self.camera = camera
     self.packageStore = packageStore
     self.stitcherOverride = stitcher
+    let experimental = ExperimentalCaptureController(motion: motion)
+    self.experimental = experimental
     useExperimentalMetalStitch = UserDefaults.standard.bool(
       forKey: Self.experimentalMetalStitchKey
     )
@@ -193,6 +214,12 @@ final class CaptureViewModel: ObservableObject {
     let loadedConfig = Self.loadSavedConfiguration()
     self.configuration = loadedConfig
     self.plan = CapturePlan(configuration: loadedConfig)
+    if let savedMode = UserDefaults.standard.string(forKey: Self.captureSessionModeKey),
+       let mode = CaptureSessionMode(rawValue: savedMode) {
+      self.captureSessionMode = mode
+    } else {
+      self.captureSessionMode = .standard
+    }
     if UserDefaults.standard.object(forKey: Self.autoFireCaptureKey) != nil {
       self.autoFireCapture = UserDefaults.standard.bool(forKey: Self.autoFireCaptureKey)
     } else {
@@ -261,6 +288,24 @@ final class CaptureViewModel: ObservableObject {
         }
       }
       .store(in: &subscriptions)
+
+    experimental.objectWillChange
+      .sink { [weak self] _ in
+        self?.objectWillChange.send()
+      }
+      .store(in: &subscriptions)
+
+    experimental.onSaved = { [weak self] package in
+      guard let self else { return }
+      self.phase = .savedExperimental(package)
+      self.statusMessage = "Experimental capture saved"
+      Task { await self.refreshGallery() }
+    }
+    experimental.onFatalError = { [weak self] message in
+      guard let self else { return }
+      self.phase = .failed(message)
+      self.statusMessage = "Capture unavailable"
+    }
   }
 
   func reloadSettingsFromDefaults() {
@@ -410,6 +455,12 @@ final class CaptureViewModel: ObservableObject {
     return SpheraEngineAdapter(nativeEngine: OpenCVSpheraEngine())
   }
 
+  var galleryItems: [GalleryCaptureItem] {
+    let standard = galleryPackages.map { GalleryCaptureItem.standard($0) }
+    let experimental = experimentalGalleryPackages.map { GalleryCaptureItem.experimental($0) }
+    return (standard + experimental).sorted { $0.sortDate > $1.sortDate }
+  }
+
   var totalFrameCount: Int { plan.targets.count }
 
   var remainingTargets: [CaptureTarget] {
@@ -427,7 +478,7 @@ final class CaptureViewModel: ObservableObject {
     configuration.downwardCount = min(8, max(4, configuration.downwardCount))
     configuration.upwardCount = min(8, max(4, configuration.upwardCount))
     switch phase {
-    case .setup, .saved, .failed:
+    case .setup, .saved, .savedExperimental, .failed:
       plan = CapturePlan(configuration: configuration)
     default:
       break
@@ -436,6 +487,12 @@ final class CaptureViewModel: ObservableObject {
 
   func startCapture() {
     guard phase == .setup || phase.isTerminal else { return }
+    captureGeneration += 1
+    let generation = captureGeneration
+    if captureSessionMode == .experimentalARKit {
+      startExperimentalCapture(generation: generation)
+      return
+    }
     rebuildPlan()
     isCameraSourceReady = false
     phase = .preparing
@@ -452,6 +509,8 @@ final class CaptureViewModel: ObservableObject {
 
     Task {
       do {
+        await experimental.stopAndAbandon()
+        guard generation == captureGeneration else { return }
         try motion.start()
         try await startCameraIfCaptureTabActive(restoreAuto: true)
         _ = try await motion.waitForFirstSample()
@@ -460,6 +519,7 @@ final class CaptureViewModel: ObservableObject {
           plan: plan,
           coreMotionReferenceFrame: motion.referenceFrameName
         )
+        guard generation == captureGeneration else { return }
         phase = .awaitingPrimary
         statusMessage = "Frame the first shot, then capture"
         stopCameraIfCaptureTabInactive()
@@ -467,8 +527,115 @@ final class CaptureViewModel: ObservableObject {
         camera.stop()
         motion.stop()
         await packageStore.abandon()
+        guard generation == captureGeneration else { return }
         phase = .failed(error.localizedDescription)
         statusMessage = "Capture unavailable"
+      }
+    }
+  }
+
+  func setCaptureSessionMode(_ mode: CaptureSessionMode) {
+    guard mode != displayedCaptureSessionMode else { return }
+    pendingCaptureSessionMode = mode
+    captureGeneration += 1
+    isCameraSourceReady = false
+    guard !isSwitchingCaptureSessionMode else { return }
+    isSwitchingCaptureSessionMode = true
+    Task {
+      defer { isSwitchingCaptureSessionMode = false }
+      while let target = pendingCaptureSessionMode {
+        let generation = captureGeneration
+        await experimental.stopAndAbandon()
+        await camera.stopAndWait()
+        motion.stop()
+        await packageStore.abandon()
+        guard generation == captureGeneration else { continue }
+        let applied = pendingCaptureSessionMode ?? target
+        capturedFrames = []
+        captureReference = nil
+        navigationReading = .unavailable
+        guidePoints = []
+        activeTarget = nil
+        alignmentHoldTracker.reset()
+        stableHoldProgress = 0
+        isCapturingPhoto = false
+        captureSessionMode = applied
+        if pendingCaptureSessionMode == applied {
+          pendingCaptureSessionMode = nil
+        } else {
+          continue
+        }
+        phase = .setup
+        statusMessage = "Ready"
+        if isCaptureTabActive {
+          startCapture()
+        }
+      }
+    }
+  }
+
+  func beginExperimentalSweep() {
+    guard phase == .experimentalReady else { return }
+    experimental.beginSweep()
+    guard experimental.isSweeping else { return }
+    phase = .experimentalScanning
+    statusMessage = experimental.statusMessage
+  }
+
+  func cancelExperimentalSweep() {
+    guard phase == .experimentalScanning else { return }
+    experimental.cancelSweep()
+    phase = .experimentalReady
+    statusMessage = experimental.statusMessage
+  }
+
+  func handleAppBackground() {
+    switch phase {
+    case .experimentalReady, .experimentalScanning:
+      experimental.handleAppBackground()
+    default:
+      break
+    }
+  }
+
+  func handleAppForeground() {
+    experimental.handleAppForeground()
+  }
+
+  private func startExperimentalCapture(generation: Int) {
+    isCameraSourceReady = false
+    captureErrorMessage = nil
+    statusMessage = "Starting ARKit world tracking"
+    Task {
+      await experimental.stopAndAbandon()
+      await camera.stopAndWait()
+      await packageStore.abandon()
+      guard generation == captureGeneration else { return }
+      phase = .preparing
+      do {
+        try await experimental.prepareSession()
+        guard generation == captureGeneration else { return }
+        phase = .experimentalReady
+        statusMessage = experimental.statusMessage
+      } catch is CancellationError {
+        guard generation == captureGeneration else { return }
+      } catch {
+        await experimental.stopAndAbandon()
+        await camera.stopAndWait()
+        guard generation == captureGeneration else { return }
+        do {
+          try await experimental.prepareSession()
+          guard generation == captureGeneration else { return }
+          phase = .experimentalReady
+          statusMessage = experimental.statusMessage
+        } catch {
+          await experimental.stopAndAbandon()
+          camera.stop()
+          motion.stop()
+          guard generation == captureGeneration else { return }
+          phase = .failed(error.localizedDescription)
+          statusMessage = "Capture unavailable"
+        }
       }
     }
   }
@@ -511,12 +678,14 @@ final class CaptureViewModel: ObservableObject {
   }
 
   func stopCapture() {
+    captureGeneration += 1
     isCameraSourceReady = false
     camera.stop()
     motion.stop()
     isCapturingPhoto = false
     Task {
       await packageStore.abandon()
+      await experimental.stopAndAbandon()
     }
     phase = .setup
     statusMessage = "Ready"
@@ -537,22 +706,30 @@ final class CaptureViewModel: ObservableObject {
   }
 
   func returnToSetup() {
+    captureGeneration += 1
+    let generation = captureGeneration
     isCameraSourceReady = false
     camera.stop()
     motion.stop()
     isCapturingPhoto = false
-    phase = .setup
-    statusMessage = "Ready"
-    stitchProgress = nil
-    captureErrorMessage = nil
-    navigationReading = .unavailable
-    guidePoints = []
-    activeTarget = nil
-    stableHoldProgress = 0
-    alignmentHoldTracker.reset()
-    captureReference = nil
-    capturedFrames = []
-    plan = CapturePlan(configuration: configuration)
+    statusMessage = "Stopping capture"
+    Task {
+      await experimental.stopAndAbandon()
+      await packageStore.abandon()
+      guard generation == captureGeneration else { return }
+      stitchProgress = nil
+      captureErrorMessage = nil
+      navigationReading = .unavailable
+      guidePoints = []
+      activeTarget = nil
+      stableHoldProgress = 0
+      alignmentHoldTracker.reset()
+      captureReference = nil
+      capturedFrames = []
+      plan = CapturePlan(configuration: configuration)
+      phase = .setup
+      statusMessage = "Ready"
+    }
   }
 
   func setCameraMode(_ mode: CameraMode) {
@@ -617,6 +794,7 @@ final class CaptureViewModel: ObservableObject {
     defer { isRefreshingGallery = false }
     do {
       galleryPackages = try await packageStore.listCompletedPackages()
+      experimentalGalleryPackages = try await experimental.listCompletedPackages()
       galleryErrorMessage = nil
     } catch {
       galleryErrorMessage = error.localizedDescription
@@ -681,6 +859,15 @@ final class CaptureViewModel: ObservableObject {
     }
   }
 
+  func deleteFromGallery(_ package: ExperimentalCapturePackage) async {
+    do {
+      try await experimental.deletePackage(package)
+      await refreshGallery()
+    } catch {
+      galleryErrorMessage = error.localizedDescription
+    }
+  }
+
   func importEnginePanorama(
     into package: CapturePackage,
     panoramaURL: URL,
@@ -718,6 +905,10 @@ final class CaptureViewModel: ObservableObject {
     try await packageStore.makeShareArchive(for: package)
   }
 
+  func makeShareArchive(for package: ExperimentalCapturePackage) async throws -> URL {
+    try await experimental.makeShareArchive(for: package)
+  }
+
   func reportGalleryError(_ message: String) {
     galleryErrorMessage = message
   }
@@ -731,6 +922,7 @@ final class CaptureViewModel: ObservableObject {
   func setCaptureTabActive(_ active: Bool) {
     let wasActive = isCaptureTabActive
     isCaptureTabActive = active
+    experimental.setTabActive(active)
     guard wasActive != active else { return }
 
     if active {
@@ -739,6 +931,8 @@ final class CaptureViewModel: ObservableObject {
         startCapture()
       case .awaitingPrimary, .capturingPoints:
         Task { await resumeCameraIfCaptureTabActive() }
+      case .experimentalReady, .experimentalScanning:
+        break
       default:
         break
       }
@@ -1081,7 +1275,7 @@ final class CaptureViewModel: ObservableObject {
 extension CaptureWorkflowPhase {
   fileprivate var isTerminal: Bool {
     switch self {
-    case .saved, .failed:
+    case .saved, .savedExperimental, .failed:
       true
     default:
       false
