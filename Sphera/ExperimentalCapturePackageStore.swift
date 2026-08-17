@@ -31,6 +31,7 @@ actor ExperimentalCapturePackageStore {
         scanLine: line,
         imageCount: configuration.imageCount(for: line),
         capturedCount: 0,
+        skippedCount: nil,
         startedAt: nil,
         completedAt: nil
       )
@@ -51,7 +52,8 @@ actor ExperimentalCapturePackageStore {
       sessionStartTimestamp: nil,
       coreMotionReferenceFrame: coreMotionReferenceFrame,
       frames: [],
-      lineSummaries: summaries
+      lineSummaries: summaries,
+      skippedTargets: nil
     )
 
     packageDirectory = directory
@@ -84,6 +86,7 @@ actor ExperimentalCapturePackageStore {
         scanLine: summary.scanLine,
         imageCount: summary.imageCount,
         capturedCount: summary.capturedCount,
+        skippedCount: summary.skippedCount,
         startedAt: summary.startedAt ?? Date(),
         completedAt: summary.completedAt
       )
@@ -92,7 +95,7 @@ actor ExperimentalCapturePackageStore {
     try write(manifest, named: "manifest.json", in: directory)
   }
 
-  func markLineCompleted(_ line: PanoramaScanLine) throws {
+  func markLineCompleted(_ line: PanoramaScanLine, skippedCount: Int = 0) throws {
     guard let directory = packageDirectory, var manifest else {
       throw ExperimentalCapturePackageError.sessionNotStarted
     }
@@ -103,6 +106,7 @@ actor ExperimentalCapturePackageStore {
         scanLine: summary.scanLine,
         imageCount: summary.imageCount,
         capturedCount: captured,
+        skippedCount: skippedCount > 0 ? skippedCount : nil,
         startedAt: summary.startedAt,
         completedAt: Date()
       )
@@ -168,6 +172,7 @@ actor ExperimentalCapturePackageStore {
         scanLine: summary.scanLine,
         imageCount: summary.imageCount,
         capturedCount: manifest.frames.filter { $0.scanLine == scanLine }.count,
+        skippedCount: summary.skippedCount,
         startedAt: summary.startedAt,
         completedAt: summary.completedAt
       )
@@ -177,12 +182,53 @@ actor ExperimentalCapturePackageStore {
     return record
   }
 
-  func finalize() throws -> ExperimentalCapturePackage {
+  /// Removes everything captured for one row, so a sweep that was interrupted
+  /// mid-row can shoot that row again without leaving duplicates behind.
+  func discardFrames(for line: PanoramaScanLine) throws {
+    guard let directory = packageDirectory, var manifest else {
+      throw ExperimentalCapturePackageError.sessionNotStarted
+    }
+    let doomed = manifest.frames.filter { $0.scanLine == line }
+    guard !doomed.isEmpty else { return }
+    let imagesDirectory = directory.appendingPathComponent(
+      manifest.imageDirectory,
+      isDirectory: true
+    )
+    for frame in doomed {
+      try? fileManager.removeItem(
+        at: imagesDirectory.appendingPathComponent(frame.imageFilename)
+      )
+    }
+    manifest.frames = manifest.frames
+      .filter { $0.scanLine != line }
+      .enumerated()
+      .map { $0.element.withSequenceIndex($0.offset) }
+    if let index = manifest.lineSummaries.firstIndex(where: { $0.scanLine == line }) {
+      let summary = manifest.lineSummaries[index]
+      manifest.lineSummaries[index] = ExperimentalScanLineSummary(
+        scanLine: summary.scanLine,
+        imageCount: summary.imageCount,
+        capturedCount: 0,
+        skippedCount: nil,
+        startedAt: summary.startedAt,
+        completedAt: nil
+      )
+    }
+    self.manifest = manifest
+    try write(manifest, named: "manifest.json", in: directory)
+  }
+
+  /// Saves the session. Angles the sweep could not reach are recorded rather
+  /// than treated as a failure, so a usable capture is never thrown away over
+  /// a handful of missing frames.
+  func finalize(
+    skippedTargets: [ExperimentalSkippedTarget] = []
+  ) throws -> ExperimentalCapturePackage {
     guard let directory = packageDirectory, var manifest else {
       throw ExperimentalCapturePackageError.sessionNotStarted
     }
     let expected = manifest.configuration.totalImageCount
-    guard manifest.frames.count == expected else {
+    guard manifest.frames.count >= manifest.configuration.minimumUsableFrameCount else {
       throw ExperimentalCapturePackageError.incompleteCapture(
         expected: expected,
         received: manifest.frames.count
@@ -191,6 +237,7 @@ actor ExperimentalCapturePackageStore {
     manifest.completedAt = Date()
     manifest.isComplete = true
     manifest.incompleteReason = nil
+    manifest.skippedTargets = skippedTargets.isEmpty ? nil : skippedTargets
     try write(manifest, named: "manifest.json", in: directory)
     packageDirectory = nil
     self.manifest = nil
@@ -346,7 +393,7 @@ enum ExperimentalCapturePackageError: LocalizedError {
     case .duplicateFrame(let id):
       "The experimental frame \(id.uuidString) was already saved."
     case .incompleteCapture(let expected, let received):
-      "The experimental package has \(received) of \(expected) required frames."
+      "Only \(received) of \(expected) photos were captured, which is too few to keep. Try the sweep again."
     case .manifestMissing:
       "The experimental capture package is missing its manifest."
     }

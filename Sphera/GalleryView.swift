@@ -557,7 +557,7 @@ private struct ExperimentalGalleryGridCard: View {
         Text(package.manifest.completedAt ?? package.manifest.createdAt, format: .dateTime)
           .font(.subheadline.weight(.semibold))
           .lineLimit(1)
-        Text("\(package.manifest.frames.count) ARKit frames · Experimental")
+        Text("\(package.manifest.frames.count) photos · Sweep")
           .font(.caption)
           .foregroundStyle(.secondary)
           .lineLimit(1)
@@ -575,12 +575,13 @@ private struct ExperimentalGalleryGridCard: View {
       .aspectRatio(1, contentMode: .fit)
       .clipShape(shape)
       .overlay(alignment: .topTrailing) {
-        Text("ARKit")
+        Label("Sweep", systemImage: CaptureSessionMode.experimentalARKit.symbolName)
+          .labelStyle(.titleAndIcon)
           .font(.caption2.weight(.bold))
           .foregroundStyle(.black)
           .padding(.horizontal, 7)
           .padding(.vertical, 4)
-          .background(Color(red: 1, green: 0.72, blue: 0.12), in: Capsule())
+          .background(.yellow, in: Capsule())
           .padding(8)
       }
       .overlay {
@@ -601,7 +602,7 @@ private struct ExperimentalGalleryGridCard: View {
     } else {
       ZStack {
         Color.secondary.opacity(0.18)
-        Image(systemName: "move.3d")
+        Image(systemName: CaptureSessionMode.experimentalARKit.symbolName)
           .font(.title)
           .foregroundStyle(.secondary)
       }
@@ -637,18 +638,19 @@ struct ExperimentalGalleryDetailView: View {
         }
       }
 
-      Section("Experimental ARKit capture") {
-        LabeledContent("Frames", value: "\(package.manifest.frames.count)")
+      Section("Sweep capture") {
+        LabeledContent("Photos", value: "\(package.manifest.frames.count)")
         LabeledContent(
           "Saved",
           value: (package.manifest.completedAt ?? package.manifest.createdAt)
             .formatted(date: .abbreviated, time: .shortened)
         )
-        LabeledContent("Kind", value: package.manifest.kind)
-        LabeledContent("Complete", value: package.manifest.isComplete ? "Yes" : "No")
+        if let skipped = package.manifest.skippedTargets, !skipped.isEmpty {
+          LabeledContent("Skipped angles", value: "\(skipped.count)")
+        }
         ForEach(package.manifest.lineSummaries, id: \.scanLine) { summary in
           LabeledContent(
-            summary.scanLine.displayName,
+            summary.scanLine.rowName,
             value: "\(summary.capturedCount)/\(summary.imageCount)"
           )
         }
@@ -658,7 +660,7 @@ struct ExperimentalGalleryDetailView: View {
         ForEach(package.manifest.frames) { frame in
           VStack(alignment: .leading, spacing: 4) {
             Text(
-              "\(frame.sequenceIndex + 1). \(frame.scanLine.displayName) \(frame.indexInLine + 1)"
+              "\(frame.sequenceIndex + 1). \(frame.scanLine.rowName) \(frame.indexInLine + 1)"
             )
             .font(.headline)
             Text(frame.imageFilename)
@@ -686,7 +688,7 @@ struct ExperimentalGalleryDetailView: View {
           }
         } label: {
           Label(
-            isSharing ? "Preparing archive…" : "Share ARKit capture archive",
+            isSharing ? "Preparing archive…" : "Share sweep archive",
             systemImage: "square.and.arrow.up"
           )
         }
@@ -704,11 +706,11 @@ struct ExperimentalGalleryDetailView: View {
         .foregroundStyle(.red)
       } footer: {
         Text(
-          "This experimental dataset is for a future computer-side stitcher. The current on-device engine does not consume ARKit captures."
+          "Sweep captures are photo sets with camera poses, meant for a computer-side stitcher. Sphera's on-device stitcher does not process them yet."
         )
       }
     }
-    .navigationTitle("ARKit Capture")
+    .navigationTitle("Sweep Capture")
     .navigationBarTitleDisplayMode(.inline)
   }
 }

@@ -78,6 +78,63 @@ enum ExperimentalPoseMath {
     return Vector3Value(x: yawPitch.yaw, y: yawPitch.pitch, z: roll)
   }
 
+  /// Progress along a locked sweep. Counterclockwise yaw is negative in
+  /// world space; the strip always advances in the positive direction.
+  static func directedYawOffsetDegrees(
+    signedOffset: Double,
+    direction: ExperimentalCaptureDirection?
+  ) -> Double {
+    switch direction {
+    case .counterclockwise:
+      -signedOffset
+    case .clockwise:
+      signedOffset
+    case .automatic, .none:
+      abs(signedOffset)
+    }
+  }
+
+  /// Horizontal field of view after EXIF 6 (landscape sensor → portrait).
+  /// The displayed width is the sensor short side, which is paired with `fy`.
+  static func portraitHorizontalFOVDegrees(
+    intrinsics: Matrix3x3Value,
+    imageWidth: Int,
+    imageHeight: Int
+  ) -> Double {
+    guard intrinsics.values.count == 9 else { return 60 }
+    let fy = intrinsics.values[4]
+    let shortSide = Double(min(imageWidth, imageHeight))
+    guard fy > 1, shortSide > 1 else { return 60 }
+    return 2 * atan(shortSide / (2 * fy)) * 180 / .pi
+  }
+
+  /// Center X of a frame on a left-origin coverage strip. The sweep always
+  /// fills left-to-right so changing direction does not flip the layout.
+  static func panoramaStripCenterX(
+    directedYawDegrees: Double,
+    scanRangeDegrees: Double,
+    canvasWidth: Double,
+    sliceWidth: Double
+  ) -> Double {
+    let range = max(scanRangeDegrees, 1)
+    let usable = max(canvasWidth - sliceWidth, 0)
+    let t = min(max(directedYawDegrees / range, 0), 1)
+    return sliceWidth / 2 + t * usable
+  }
+
+  /// Leading-edge column for a live slit. Yaw 0 sits at the right edge of the
+  /// starting FOV so the first full frame and later slits share one angle map.
+  static func panoramaSlitColumn(
+    directedYawDegrees: Double,
+    horizontalFOVDegrees: Double,
+    scanRangeDegrees: Double,
+    canvasWidth: Double
+  ) -> Double {
+    let range = max(scanRangeDegrees, 1)
+    let t = (directedYawDegrees + max(horizontalFOVDegrees, 1)) / range
+    return min(max(t, 0), 1) * canvasWidth
+  }
+
   /// SwiftUI Y offset for the path arrow. Positive Y is down, so aiming
   /// below the intended line produces a positive offset.
   static func arrowScreenYOffset(
@@ -161,14 +218,8 @@ enum ExperimentalPoseMath {
     return screenPlaneRollDegrees(gravityDevice: gravityDevice)
   }
 
-  static func screenPlaneRollInstruction(rollDegrees: Double) -> String {
-    if rollDegrees > 0.5 {
-      return "Rotate the phone left until it's upright"
-    }
-    if rollDegrees < -0.5 {
-      return "Rotate the phone right until it's upright"
-    }
-    return "Keep the phone upright"
+  static func screenPlaneRollInstruction(rollDegrees _: Double) -> String {
+    "Keep iPhone Level"
   }
 }
 
@@ -193,13 +244,13 @@ struct ExperimentalAttitudeReading: Equatable, Sendable {
 
   var primaryWarning: String? {
     if isRollBlockingCapture {
-      return "Level the phone"
+      return "Keep iPhone Level"
     }
     if isAbovePath {
-      return "Lower the phone"
+      return "Lower iPhone"
     }
     if isBelowPath {
-      return "Raise the phone"
+      return "Raise iPhone"
     }
     return nil
   }
@@ -259,8 +310,8 @@ struct ExperimentalAttitudeReading: Equatable, Sendable {
         rollDegrees: roll
       ),
       pitchCorrectionInstruction: pitchError > 0
-        ? "Lower the phone onto the line"
-        : "Raise the phone onto the line"
+        ? "Lower iPhone"
+        : "Raise iPhone"
     )
   }
 }

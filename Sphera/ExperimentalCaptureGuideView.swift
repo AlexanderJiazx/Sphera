@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct CaptureSessionModeSwitch: View {
   let mode: CaptureSessionMode
@@ -23,168 +24,185 @@ private struct EqualizedCaptureSessionModeSwitch: View, Equatable {
   var body: some View {
     Menu {
       Picker(
-        "Capture mode",
+        "Capture Mode",
         selection: Binding(
           get: { mode },
-          set: { newMode in
-            onSelect(newMode)
-          }
+          set: { onSelect($0) }
         )
       ) {
         ForEach(CaptureSessionMode.allCases, id: \.self) { sessionMode in
-          Label(
-            sessionMode == .standard ? "Points" : "ARKit Experimental",
-            systemImage: sessionMode == .experimentalARKit ? "move.3d" : "circle.grid.3x3.fill"
-          )
-          .tag(sessionMode)
+          Label(sessionMode.menuTitle, systemImage: sessionMode.symbolName)
+            .tag(sessionMode)
         }
       }
     } label: {
       HStack(spacing: 6) {
-        Image(systemName: mode == .experimentalARKit ? "move.3d" : "circle.grid.3x3.fill")
-          .font(.subheadline.weight(.bold))
+        Image(systemName: mode.symbolName)
+          .font(.subheadline.weight(.semibold))
         Text(mode.title)
-          .font(.subheadline.weight(.bold))
-        Image(systemName: "chevron.down")
-          .font(.caption2.weight(.bold))
+          .font(.subheadline.weight(.semibold))
       }
-      .foregroundStyle(mode == .experimentalARKit ? .black : .white)
+      .foregroundStyle(.white)
       .padding(.horizontal, 14)
       .padding(.vertical, 8)
-      .background {
-        if mode == .experimentalARKit {
-          Capsule().fill(Color(red: 1, green: 0.72, blue: 0.12))
-        }
-      }
       .liquidGlassInteractive(in: Capsule())
     }
     .contentShape(Capsule())
     .frame(minHeight: 44)
     .disabled(!isEnabled)
-    .opacity(isEnabled ? 1 : 0.55)
+    .opacity(isEnabled ? 1 : 0.4)
     .accessibilityLabel(mode.accessibilityLabel)
-    .accessibilityHint("Switches between standard point capture and experimental ARKit panorama capture")
+    .accessibilityHint("Changes how Sphera captures a panorama")
   }
 }
 
-struct ExperimentalCaptureGuideView: View {
-  let guidance: ExperimentalGuidanceSnapshot
-  let isCapturingPhoto: Bool
+// MARK: - Sweep guides
+
+/// A level indicator in the spirit of the Camera app's: a fixed target line
+/// and a moving line that carries the phone's tilt and roll. They merge and
+/// turn yellow when the phone is on the row.
+struct ExperimentalLevelGuide: View, Equatable {
+  let pitchErrorDegrees: Double
+  let rollDegrees: Double
+  let guideScaleDegrees: Double
+  let isAligned: Bool
+  let isBlocked: Bool
+  let holdFraction: Double
+
+  private let lineWidth: CGFloat = 128
+  private let maxOffset: Double = 96
+
+  static func == (lhs: Self, rhs: Self) -> Bool {
+    lhs.pitchErrorDegrees == rhs.pitchErrorDegrees
+      && lhs.rollDegrees == rhs.rollDegrees
+      && lhs.isAligned == rhs.isAligned
+      && lhs.isBlocked == rhs.isBlocked
+      && lhs.holdFraction == rhs.holdFraction
+  }
+
+  var body: some View {
+    let offset = ExperimentalPoseMath.arrowScreenYOffset(
+      pitchErrorDegrees: pitchErrorDegrees,
+      scaleDegrees: guideScaleDegrees,
+      maxOffset: maxOffset
+    )
+
+    ZStack {
+      // Where the row wants the phone to be.
+      Capsule()
+        .fill(.white.opacity(isAligned ? 0 : 0.5))
+        .frame(width: lineWidth, height: 2)
+        .shadow(color: .black.opacity(0.4), radius: 2)
+
+      // Where the phone actually is.
+      Capsule()
+        .fill(tint)
+        .frame(width: lineWidth, height: isAligned ? 3 : 2)
+        .rotationEffect(.degrees(-rollDegrees))
+        .offset(y: CGFloat(offset))
+        .shadow(color: .black.opacity(0.4), radius: 2)
+
+      // Fills while the phone sits on the row, so the wait before a row starts
+      // is visible rather than mysterious.
+      if holdFraction > 0 {
+        Circle()
+          .trim(from: 0, to: holdFraction)
+          .stroke(tint, style: StrokeStyle(lineWidth: 2.5, lineCap: .round))
+          .rotationEffect(.degrees(-90))
+          .frame(width: 44, height: 44)
+          .offset(y: CGFloat(offset))
+      }
+    }
+    .frame(height: 240)
+    .animation(.interactiveSpring(response: 0.24, dampingFraction: 0.86), value: offset)
+    .animation(.interactiveSpring(response: 0.24, dampingFraction: 0.86), value: rollDegrees)
+    .animation(.easeOut(duration: 0.15), value: isAligned)
+    .accessibilityHidden(true)
+  }
+
+  private var tint: Color {
+    if isBlocked { return .white }
+    return isAligned ? .yellow : .white
+  }
+}
+
+/// Progress around the row. The live slit-scan sits behind evenly spaced ticks
+/// so the user can see both what has been photographed and where they are.
+struct ExperimentalCoverageTrack: View {
+  let targetStates: [ExperimentalTargetState]
+  let sweepFraction: Double
+  let isDimmed: Bool
+  let strip: UIImage?
+
+  private let height: CGFloat = 56
 
   var body: some View {
     GeometryReader { geometry in
-      let size = geometry.size
-      ZStack {
-        ForEach(PanoramaScanLine.guideOrder) { line in
-          scanLine(line, in: size)
+      let width = geometry.size.width
+      let shape = RoundedRectangle(cornerRadius: 14, style: .continuous)
+
+      ZStack(alignment: .leading) {
+        shape.fill(.black.opacity(0.35))
+
+        if let strip {
+          Image(uiImage: strip)
+            .resizable()
+            .frame(width: width, height: height)
+            .clipShape(shape)
+            .opacity(0.9)
         }
-      }
-      .rotationEffect(.degrees(-guidance.rollDegrees))
-      .animation(
-        .interactiveSpring(response: 0.2, dampingFraction: 0.86),
-        value: guidance.rollDegrees
-      )
-      .frame(width: size.width, height: size.height)
-    }
-    .allowsHitTesting(false)
-  }
 
-  private func scanLine(_ line: PanoramaScanLine, in size: CGSize) -> some View {
-    let isActive = guidance.activeLine == line
-    let isNext = guidance.isTransitioning && guidance.activeLine == line
-    let width = size.width - 48
-    let progress = isActive ? guidance.lineProgress : 0
-    let pitchOffset = isActive
-      ? CGFloat(
-        ExperimentalPoseMath.arrowScreenYOffset(
-          pitchErrorDegrees: guidance.pitchErrorDegrees,
-          scaleDegrees: guidance.pitchGuideScaleDegrees,
-          maxOffset: 48
-        )
-      )
-      : 0
-    let arrowX = CGFloat(progress) * (width - 28) - width / 2 + 14
-    let accent = accentColor(for: line, isActive: isActive)
-
-    return ZStack {
-      Capsule()
-        .fill(accent.opacity(isActive ? 0.95 : 0.32))
-        .frame(width: width, height: isActive ? 3 : 1.5)
-
-      if isActive || isNext {
-        ZStack {
-          Image(systemName: arrowSymbol)
-            .font(.system(size: 18, weight: .bold))
-            .foregroundStyle(accent)
-            .shadow(color: .black.opacity(0.55), radius: 2, y: 1)
-            .opacity(isCapturingPhoto && isActive ? 0.2 : 1)
-          if isCapturingPhoto, isActive {
-            ProgressView()
-              .controlSize(.mini)
-              .tint(.white)
+        HStack(spacing: 0) {
+          ForEach(Array(targetStates.enumerated()), id: \.offset) { _, state in
+            Capsule()
+              .fill(color(for: state))
+              .frame(width: 3, height: 12)
+              .frame(maxWidth: .infinity)
           }
         }
-        .offset(x: arrowX, y: pitchOffset)
-        .animation(
-          .interactiveSpring(response: 0.22, dampingFraction: 0.86),
-          value: pitchOffset
-        )
-        .animation(
-          .interactiveSpring(response: 0.28, dampingFraction: 0.9),
-          value: progress
-        )
+        .padding(.horizontal, 4)
+        .frame(maxHeight: .infinity, alignment: .bottom)
+        .padding(.bottom, 6)
+
+        Capsule()
+          .fill(.white)
+          .frame(width: 3, height: height - 12)
+          .shadow(color: .black.opacity(0.5), radius: 2)
+          .offset(x: min(max(CGFloat(sweepFraction) * width, 2), width - 5))
+          .animation(.interactiveSpring(response: 0.3, dampingFraction: 0.9), value: sweepFraction)
       }
+      .overlay {
+        shape.strokeBorder(.white.opacity(0.14), lineWidth: 1)
+      }
+      .clipShape(shape)
     }
-    .frame(width: width, height: 56)
-    .position(x: size.width / 2, y: size.height * line.guideYFraction)
-    .opacity(isActive || isNext || guidance.activeLine == nil ? 1 : 0.35)
-    .accessibilityLabel("\(line.displayName) scan line")
+    .frame(height: height)
+    .opacity(isDimmed ? 0.6 : 1)
+    .animation(.easeInOut(duration: 0.15), value: isDimmed)
+    .accessibilityHidden(true)
   }
 
-  private var arrowSymbol: String {
-    if guidance.isWrongDirection {
-      return guidance.rotationDirection == .counterclockwise ? "arrow.right" : "arrow.left"
-    }
-    switch guidance.rotationDirection {
-    case .counterclockwise:
-      return "arrow.left"
-    case .clockwise:
-      return "arrow.right"
-    case .automatic, .none:
-      return "arrow.left.and.right"
-    }
-  }
-
-  private func accentColor(for line: PanoramaScanLine, isActive: Bool) -> Color {
-    if isActive, guidance.guideAccentIsBlocking {
-      return .red
-    }
-    if isActive {
-      return Color(red: 1, green: 0.84, blue: 0.08)
-    }
-    switch line {
-    case .upward:
-      return Color.mint
-    case .horizontal:
-      return Color.white
-    case .downward:
-      return Color.orange
+  private func color(for state: ExperimentalTargetState) -> Color {
+    switch state {
+    case .captured: .yellow
+    case .skipped: .white.opacity(0.25)
+    case .pending: .white.opacity(0.5)
     }
   }
 }
 
-extension PanoramaScanLine: Identifiable {
-  var id: String { rawValue }
-}
+/// The short "fix this" badge. Deliberately small and centered so it reads
+/// like the Camera app's own hints rather than an error dialog.
+struct ExperimentalAlertBadge: View {
+  let text: String
 
-private extension PanoramaScanLine {
-  static var guideOrder: [PanoramaScanLine] { [.upward, .horizontal, .downward] }
-
-  var guideYFraction: CGFloat {
-    switch self {
-    case .upward: 0.38
-    case .horizontal: 0.50
-    case .downward: 0.62
-    }
+  var body: some View {
+    Text(text)
+      .font(.subheadline.weight(.semibold))
+      .foregroundStyle(.black)
+      .padding(.horizontal, 14)
+      .padding(.vertical, 7)
+      .background(.yellow, in: Capsule())
+      .accessibilityHidden(true)
   }
 }

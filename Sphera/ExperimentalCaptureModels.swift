@@ -66,6 +66,19 @@ enum ARKitTrackingStateRecord: String, Codable, Sendable {
     case .normal: "Normal"
     }
   }
+
+  /// Plain-language explanation for the viewfinder. `nil` means nothing worth
+  /// interrupting the user about.
+  var userAdvice: String? {
+    switch self {
+    case .normal, .limitedOther: nil
+    case .notAvailable: "Waiting for motion tracking"
+    case .limitedInitializing: "Move iPhone slowly to start tracking"
+    case .limitedExcessiveMotion: "Slow down"
+    case .limitedInsufficientFeatures: "Point at something with more detail"
+    case .limitedRelocalizing: "Return to where you started"
+    }
+  }
 }
 
 struct ARKitCameraMetadata: Codable, Equatable, Sendable {
@@ -100,10 +113,42 @@ struct ExperimentalCapturedFrame: Codable, Identifiable, Equatable, Sendable {
   let qualityNotes: [String]
 }
 
+extension ExperimentalCapturedFrame {
+  /// Frames are renumbered when a row is discarded and re-shot, so the
+  /// sequence stays contiguous in the exported manifest.
+  func withSequenceIndex(_ index: Int) -> ExperimentalCapturedFrame {
+    ExperimentalCapturedFrame(
+      id: id,
+      imageFilename: imageFilename,
+      captureTimestamp: captureTimestamp,
+      scanLine: scanLine,
+      indexInLine: indexInLine,
+      lineImageCount: lineImageCount,
+      sequenceIndex: index,
+      targetYawOffsetDegrees: targetYawOffsetDegrees,
+      actualYawOffsetDegrees: actualYawOffsetDegrees,
+      actualPitchDegrees: actualPitchDegrees,
+      arkit: arkit,
+      motion: motion,
+      photo: photo,
+      qualityNotes: qualityNotes
+    )
+  }
+}
+
+/// A planned angle the sweep passed without a usable photo. Recorded so a
+/// consumer of the dataset can tell a gap from a truncated session.
+struct ExperimentalSkippedTarget: Codable, Equatable, Sendable {
+  let scanLine: PanoramaScanLine
+  let indexInLine: Int
+  let targetYawOffsetDegrees: Double
+}
+
 struct ExperimentalScanLineSummary: Codable, Equatable, Sendable {
   let scanLine: PanoramaScanLine
   let imageCount: Int
   let capturedCount: Int
+  var skippedCount: Int?
   let startedAt: Date?
   let completedAt: Date?
 }
@@ -124,6 +169,7 @@ struct ExperimentalCaptureManifest: Codable, Equatable, Sendable {
   let coreMotionReferenceFrame: String
   var frames: [ExperimentalCapturedFrame]
   var lineSummaries: [ExperimentalScanLineSummary]
+  var skippedTargets: [ExperimentalSkippedTarget]?
 
   static let currentSchemaVersion = 1
   static let kindIdentifier = "experimental-arkit-panorama"
@@ -156,6 +202,14 @@ extension ExperimentalCapturePackage {
     directoryURL
       .appendingPathComponent(manifest.imageDirectory, isDirectory: true)
       .appendingPathComponent(filename)
+  }
+}
+
+extension ExperimentalCapturedFrame {
+  func imageURL(inPackageDirectory directory: URL) -> URL {
+    directory
+      .appendingPathComponent("images", isDirectory: true)
+      .appendingPathComponent(imageFilename)
   }
 }
 
@@ -198,78 +252,112 @@ struct ExperimentalLivePose: Equatable, Sendable {
   let rotationRateMagnitude: Double
 }
 
+// MARK: - Guidance
+
+/// What the sweep is doing right now. Every visible piece of chrome is derived
+/// from this, so the interface can never disagree with the capture engine.
+enum ExperimentalCaptureStage: String, Equatable, Sendable {
+  /// ARKit is warming up; there is nothing the user can do yet.
+  case starting
+  /// Tracking is live and the shutter is armed.
+  case ready
+  /// A row is queued and the user needs to get the phone onto its guide line.
+  case aligning
+  /// Photos are being taken as the user turns.
+  case scanning
+  /// The row just finished; a short confirmation before the next one.
+  case rowComplete
+  /// Writing the session to disk.
+  case finishing
+  /// Recoverable stop: backgrounded, a call arrived, tracking dropped out.
+  case paused
+  /// Unrecoverable; the failure screen takes over.
+  case unavailable
+
+  var isSweepInProgress: Bool {
+    switch self {
+    case .aligning, .scanning, .rowComplete: true
+    case .starting, .ready, .finishing, .paused, .unavailable: false
+    }
+  }
+
+  /// Whether the level guide and coverage track belong on screen.
+  var showsSweepGuides: Bool {
+    switch self {
+    case .aligning, .scanning, .rowComplete: true
+    case .starting, .ready, .finishing, .paused, .unavailable: false
+    }
+  }
+}
+
 struct ExperimentalGuidanceSnapshot: Equatable, Sendable {
-  var activeLine: PanoramaScanLine?
-  var nextLine: PanoramaScanLine?
-  var isTransitioning: Bool
-  var isReadyToStart: Bool
-  var lineProgress: Double
+  var stage: ExperimentalCaptureStage
+  var line: PanoramaScanLine
+  var passIndex: Int
+  var passCount: Int
   var capturedInLine: Int
+  var skippedInLine: Int
   var targetInLine: Int
   var capturedTotal: Int
   var targetTotal: Int
+  var targetStates: [ExperimentalTargetState]
+  var sweepFraction: Double
+  var directedYawOffsetDegrees: Double
+  var scanRangeDegrees: Double
   var pitchErrorDegrees: Double
   var rollDegrees: Double
-  var currentYawOffsetDegrees: Double
-  var isAbovePath: Bool
-  var isBelowPath: Bool
-  var isRolled: Bool
-  var isPitchBlockingCapture: Bool
-  var isRollBlockingCapture: Bool
-  var isWrongDirection: Bool
-  var isTranslatingTooMuch: Bool
-  var isLineComplete: Bool
-  var trackingState: ARKitTrackingStateRecord
-  var expectedOrientationLabel: String
-  var instruction: String
-  var warningMessage: String?
-  var rotationDirection: ExperimentalCaptureDirection?
-  var rollCorrectionInstruction: String
   var pitchGuideScaleDegrees: Double
+  var isLevelForCapture: Bool
+  var alignmentHoldFraction: Double
+  var blockReason: ExperimentalCaptureBlockReason?
+  var trackingState: ARKitTrackingStateRecord
+  var rotationDirection: ExperimentalCaptureDirection?
+  var title: String
+  var subtitle: String?
 
-  var shouldBlockCapture: Bool {
-    isPitchBlockingCapture || isRollBlockingCapture
+  /// Short heads-up shown over the viewfinder while something needs fixing.
+  var alert: String? {
+    blockReason?.badge
   }
 
-  var chromeCaption: String {
-    if let activeLine {
-      let remaining = max(targetInLine - capturedInLine, 0)
-      return "\(activeLine.displayName) · \(remaining) left"
-    }
-    return "\(targetTotal) photos · three lines"
+  var isBlocked: Bool { blockReason != nil }
+
+  var passCaption: String {
+    "Pass \(passIndex) of \(passCount) · \(line.rowName)"
   }
 
-  var guideAccentIsBlocking: Bool {
-    warningMessage != nil
+  var photoCaption: String {
+    "\(capturedInLine) of \(targetInLine) photos"
+  }
+
+  var totalProgress: Double {
+    guard targetTotal > 0 else { return 0 }
+    return min(1, Double(capturedTotal) / Double(targetTotal))
   }
 
   static let idle = ExperimentalGuidanceSnapshot(
-    activeLine: nil,
-    nextLine: .horizontal,
-    isTransitioning: false,
-    isReadyToStart: true,
-    lineProgress: 0,
+    stage: .starting,
+    line: .horizontal,
+    passIndex: 1,
+    passCount: ExperimentalPanoramaConfiguration.default.scanLineOrder.count,
     capturedInLine: 0,
+    skippedInLine: 0,
     targetInLine: ExperimentalPanoramaConfiguration.default.horizontalImageCount,
     capturedTotal: 0,
     targetTotal: ExperimentalPanoramaConfiguration.default.totalImageCount,
+    targetStates: [],
+    sweepFraction: 0,
+    directedYawOffsetDegrees: 0,
+    scanRangeDegrees: ExperimentalPanoramaConfiguration.default.scanRangeDegrees,
     pitchErrorDegrees: 0,
     rollDegrees: 0,
-    currentYawOffsetDegrees: 0,
-    isAbovePath: false,
-    isBelowPath: false,
-    isRolled: false,
-    isPitchBlockingCapture: false,
-    isRollBlockingCapture: false,
-    isWrongDirection: false,
-    isTranslatingTooMuch: false,
-    isLineComplete: false,
+    pitchGuideScaleDegrees: ExperimentalPanoramaConfiguration.default.pitchGuideScaleDegrees,
+    isLevelForCapture: false,
+    alignmentHoldFraction: 0,
+    blockReason: nil,
     trackingState: .notAvailable,
-    expectedOrientationLabel: PanoramaScanLine.horizontal.expectedOrientationLabel,
-    instruction: "Tap the shutter, then rotate",
-    warningMessage: nil,
     rotationDirection: nil,
-    rollCorrectionInstruction: "Keep the phone upright",
-    pitchGuideScaleDegrees: ExperimentalPanoramaConfiguration.default.pitchGuideScaleDegrees
+    title: "Starting camera",
+    subtitle: nil
   )
 }

@@ -161,6 +161,9 @@ final class CaptureViewModel: ObservableObject {
   @Published private(set) var isRefreshingGallery = false
   @Published private(set) var isSwitchingCaptureSessionMode = false
   @Published private(set) var pendingCaptureSessionMode: CaptureSessionMode?
+  /// The current failure can only be resolved in Settings, so the failure
+  /// screen offers a shortcut instead of an instruction the user can't act on.
+  @Published private(set) var captureFailureNeedsSettings = false
 
   var displayedCaptureSessionMode: CaptureSessionMode {
     pendingCaptureSessionMode ?? captureSessionMode
@@ -297,13 +300,15 @@ final class CaptureViewModel: ObservableObject {
 
     experimental.onSaved = { [weak self] package in
       guard let self else { return }
+      self.captureFailureNeedsSettings = false
       self.phase = .savedExperimental(package)
-      self.statusMessage = "Experimental capture saved"
+      self.statusMessage = "Sweep saved"
       Task { await self.refreshGallery() }
     }
-    experimental.onFatalError = { [weak self] message in
+    experimental.onFatalError = { [weak self] failure in
       guard let self else { return }
-      self.phase = .failed(message)
+      self.captureFailureNeedsSettings = failure.needsCameraPermission
+      self.phase = .failed(failure.message)
       self.statusMessage = "Capture unavailable"
     }
   }
@@ -577,16 +582,16 @@ final class CaptureViewModel: ObservableObject {
   func beginExperimentalSweep() {
     guard phase == .experimentalReady else { return }
     experimental.beginSweep()
-    guard experimental.isSweeping else { return }
+    guard experimental.isSweepInProgress else { return }
     phase = .experimentalScanning
-    statusMessage = experimental.statusMessage
+    statusMessage = "Sweeping"
   }
 
   func cancelExperimentalSweep() {
     guard phase == .experimentalScanning else { return }
     experimental.cancelSweep()
     phase = .experimentalReady
-    statusMessage = experimental.statusMessage
+    statusMessage = "Ready to sweep"
   }
 
   func handleAppBackground() {
@@ -605,7 +610,8 @@ final class CaptureViewModel: ObservableObject {
   private func startExperimentalCapture(generation: Int) {
     isCameraSourceReady = false
     captureErrorMessage = nil
-    statusMessage = "Starting ARKit world tracking"
+    captureFailureNeedsSettings = false
+    statusMessage = "Starting camera"
     Task {
       await experimental.stopAndAbandon()
       await camera.stopAndWait()
@@ -616,10 +622,12 @@ final class CaptureViewModel: ObservableObject {
         try await experimental.prepareSession()
         guard generation == captureGeneration else { return }
         phase = .experimentalReady
-        statusMessage = experimental.statusMessage
+        statusMessage = "Ready to sweep"
       } catch is CancellationError {
         guard generation == captureGeneration else { return }
       } catch {
+        // A first failure is usually the previous session still tearing down,
+        // so give it exactly one clean retry before bothering the user.
         await experimental.stopAndAbandon()
         await camera.stopAndWait()
         guard generation == captureGeneration else { return }
@@ -627,13 +635,17 @@ final class CaptureViewModel: ObservableObject {
           try await experimental.prepareSession()
           guard generation == captureGeneration else { return }
           phase = .experimentalReady
-          statusMessage = experimental.statusMessage
+          statusMessage = "Ready to sweep"
+        } catch is CancellationError {
+          guard generation == captureGeneration else { return }
         } catch {
           await experimental.stopAndAbandon()
           camera.stop()
           motion.stop()
           guard generation == captureGeneration else { return }
-          phase = .failed(error.localizedDescription)
+          let failure = ExperimentalCaptureFailure(error: error)
+          captureFailureNeedsSettings = failure.needsCameraPermission
+          phase = .failed(failure.message)
           statusMessage = "Capture unavailable"
         }
       }
@@ -712,6 +724,7 @@ final class CaptureViewModel: ObservableObject {
     camera.stop()
     motion.stop()
     isCapturingPhoto = false
+    captureFailureNeedsSettings = false
     statusMessage = "Stopping capture"
     Task {
       await experimental.stopAndAbandon()

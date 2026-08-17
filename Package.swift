@@ -36,6 +36,7 @@ let package = Package(
         "ExperimentalCaptureController.swift",
         "ExperimentalCaptureGuideView.swift",
         "ExperimentalCaptureScreen.swift",
+        "ExperimentalLivePanoPreview.swift",
       ],
       sources: [
         "AlignmentHoldTracker.swift",

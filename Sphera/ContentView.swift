@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct ContentView: View {
   @StateObject private var model = CaptureViewModel()
@@ -143,11 +144,12 @@ private struct CaptureTabView: View {
     case .failed(let message):
       FailureView(
         message: message,
+        showsSettingsShortcut: model.captureFailureNeedsSettings,
         retry: {
           model.returnToSetup()
         },
         alternativeTitle: model.captureSessionMode == .experimentalARKit
-          ? "Use standard capture"
+          ? "Use Points capture"
           : nil,
         alternative: model.captureSessionMode == .experimentalARKit
           ? { model.setCaptureSessionMode(.standard) }
@@ -874,13 +876,16 @@ private struct StatusView: View {
 
 private struct FailureView: View {
   let message: String
+  var showsSettingsShortcut: Bool = false
   let retry: () -> Void
   var alternativeTitle: String? = nil
   var alternative: (() -> Void)? = nil
 
+  @Environment(\.openURL) private var openURL
+
   var body: some View {
     VStack(spacing: 16) {
-      Image(systemName: "exclamationmark.triangle")
+      Image(systemName: "exclamationmark.triangle.fill")
         .font(.system(size: 42))
         .foregroundStyle(.orange)
       Text("Capture unavailable")
@@ -888,12 +893,30 @@ private struct FailureView: View {
       Text(message)
         .multilineTextAlignment(.center)
         .foregroundStyle(.secondary)
-      Button("Try again", action: retry)
-        .buttonStyle(.borderedProminent)
-      if let alternativeTitle, let alternative {
-        Button(alternativeTitle, action: alternative)
-          .buttonStyle(.bordered)
+
+      VStack(spacing: 10) {
+        if showsSettingsShortcut {
+          // Nothing else can succeed until the permission is granted, so that
+          // is the prominent action.
+          Button("Open Settings") {
+            if let url = URL(string: UIApplication.openSettingsURLString) {
+              openURL(url)
+            }
+          }
+          .buttonStyle(.borderedProminent)
+          Button("Try again", action: retry)
+            .buttonStyle(.bordered)
+        } else {
+          Button("Try again", action: retry)
+            .buttonStyle(.borderedProminent)
+        }
+        if let alternativeTitle, let alternative {
+          Button(alternativeTitle, action: alternative)
+            .buttonStyle(.bordered)
+        }
       }
+      .controlSize(.large)
+      .padding(.top, 4)
     }
     .padding(30)
   }

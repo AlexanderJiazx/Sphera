@@ -1321,6 +1321,71 @@ func experimentalAttitudeGatePrefersWorsePitchSensor() {
   #expect(rolled.primaryWarning != nil)
 }
 
+@Test("Live slit columns advance by yaw, not by frame count")
+func experimentalPanoSlitColumnIsAngleEven() {
+  let start = ExperimentalPoseMath.panoramaSlitColumn(
+    directedYawDegrees: 0,
+    horizontalFOVDegrees: 60,
+    scanRangeDegrees: 360,
+    canvasWidth: 360
+  )
+  let later = ExperimentalPoseMath.panoramaSlitColumn(
+    directedYawDegrees: 30,
+    horizontalFOVDegrees: 60,
+    scanRangeDegrees: 360,
+    canvasWidth: 360
+  )
+  #expect(abs(start - 60) < 0.001)
+  #expect(abs(later - 90) < 0.001)
+  #expect(later - start == 30)
+}
+
+@Test("Coverage strip keeps counterclockwise motion on the left-to-right path")
+func experimentalPanoStripDoesNotFlipForLeftRotation() {
+  #expect(
+    ExperimentalPoseMath.directedYawOffsetDegrees(
+      signedOffset: -45,
+      direction: .counterclockwise
+    ) == 45
+  )
+  #expect(
+    ExperimentalPoseMath.directedYawOffsetDegrees(
+      signedOffset: 45,
+      direction: .clockwise
+    ) == 45
+  )
+
+  let start = ExperimentalPoseMath.panoramaStripCenterX(
+    directedYawDegrees: 0,
+    scanRangeDegrees: 360,
+    canvasWidth: 360,
+    sliceWidth: 60
+  )
+  let mid = ExperimentalPoseMath.panoramaStripCenterX(
+    directedYawDegrees: 180,
+    scanRangeDegrees: 360,
+    canvasWidth: 360,
+    sliceWidth: 60
+  )
+  #expect(abs(start - 30) < 0.001)
+  #expect(mid > start)
+}
+
+@Test("Portrait horizontal FOV uses the sensor short side and fy")
+func experimentalPortraitHorizontalFOVFromIntrinsics() {
+  let intrinsics = Matrix3x3Value(values: [
+    1000, 0, 1000,
+    0, 1000, 500,
+    0, 0, 1,
+  ])
+  let fov = ExperimentalPoseMath.portraitHorizontalFOVDegrees(
+    intrinsics: intrinsics,
+    imageWidth: 2000,
+    imageHeight: 1000
+  )
+  #expect(abs(fov - (2 * atan(0.5) * 180 / .pi)) < 0.01)
+}
+
 @Test("Path arrow moves down when the phone aims below the line")
 func experimentalArrowOffsetMatchesPhonePitch() {
   let below = ExperimentalPoseMath.arrowScreenYOffset(pitchErrorDegrees: -5)
@@ -1350,6 +1415,103 @@ func experimentalScanProgressorCompletesLine() {
   #expect(done.isLineComplete)
   #expect(done.captureIndex == nil)
   #expect(done.capturedCount == 3)
+}
+
+@Test("A row whose gate never opens still finishes instead of hanging")
+func experimentalScanProgressorSkipsPastBlockedTargets() {
+  var config = ExperimentalPanoramaConfiguration.default
+  config.horizontalImageCount = 4
+  config.scanRangeDegrees = 360
+  config.yawSmoothingAlpha = 1
+  config.captureHysteresisDegrees = 0.5
+  config.maxRollForCaptureDegrees = 9
+  config.captureDirection = .clockwise
+  var progressor = ExperimentalScanProgressor(configuration: config)
+  progressor.beginLine(.horizontal, currentYawDegrees: 0)
+
+  // The phone stays visibly tilted for the whole turn.
+  var last = ExperimentalScanUpdate.empty
+  for step in stride(from: 0.0, through: 360.0, by: 10.0) {
+    last = progressor.update(makeScanSample(yaw: step, roll: 30, timestamp: step))
+    #expect(last.captureIndex == nil)
+  }
+
+  #expect(last.blockReason == .rolled)
+  #expect(last.isLineComplete)
+  #expect(last.skippedCount == 4)
+  #expect(last.targetStates.allSatisfy { $0 == .skipped })
+  #expect(progressor.skippedIndexList == [0, 1, 2, 3])
+}
+
+@Test("No target is handed out while the previous photo is still being written")
+func experimentalScanProgressorWaitsForBusyController() {
+  var config = ExperimentalPanoramaConfiguration.default
+  config.horizontalImageCount = 4
+  config.scanRangeDegrees = 360
+  config.yawSmoothingAlpha = 1
+  config.captureHysteresisDegrees = 0.5
+  config.captureDirection = .clockwise
+  var progressor = ExperimentalScanProgressor(configuration: config)
+  progressor.beginLine(.horizontal, currentYawDegrees: 0)
+
+  let busy = progressor.update(makeScanSample(yaw: 0, timestamp: 1), canCapture: false)
+  #expect(busy.captureIndex == nil)
+  #expect(busy.targetStates == [.pending, .pending, .pending, .pending])
+
+  // The same angle is offered again as soon as the controller is free.
+  let free = progressor.update(makeScanSample(yaw: 0.5, timestamp: 2), canCapture: true)
+  #expect(free.captureIndex == 0)
+}
+
+@Test("A target that keeps failing to save is given up on, not retried forever")
+func experimentalScanProgressorAbandonsFailingTarget() {
+  var config = ExperimentalPanoramaConfiguration.default
+  config.horizontalImageCount = 4
+  config.scanRangeDegrees = 360
+  config.yawSmoothingAlpha = 1
+  config.captureHysteresisDegrees = 0.5
+  config.captureDirection = .clockwise
+  var progressor = ExperimentalScanProgressor(configuration: config)
+  progressor.beginLine(.horizontal, currentYawDegrees: 0)
+
+  for attempt in 0..<ExperimentalScanProgressor.maximumAttemptsPerTarget {
+    let update = progressor.update(makeScanSample(yaw: 0, timestamp: Double(attempt)))
+    #expect(update.captureIndex == 0)
+    progressor.noteCaptureFinished(success: false)
+  }
+
+  let afterGivingUp = progressor.update(makeScanSample(yaw: 0, timestamp: 10))
+  #expect(afterGivingUp.captureIndex == nil)
+  #expect(afterGivingUp.targetStates.first == .skipped)
+
+  // The row carries on to the angles behind it.
+  let next = progressor.update(makeScanSample(yaw: 90, timestamp: 11))
+  #expect(next.captureIndex == 1)
+}
+
+@Test("Turning the right way again clears the reverse-direction warning immediately")
+func experimentalScanProgressorRecoversFromReverse() {
+  var config = ExperimentalPanoramaConfiguration.default
+  config.horizontalImageCount = 8
+  config.scanRangeDegrees = 360
+  config.yawSmoothingAlpha = 1
+  config.captureHysteresisDegrees = 0.5
+  config.captureDirection = .clockwise
+  config.wrongDirectionDegrees = 6
+  var progressor = ExperimentalScanProgressor(configuration: config)
+  progressor.beginLine(.horizontal, currentYawDegrees: 0)
+  _ = progressor.update(makeScanSample(yaw: 0, timestamp: 1))
+  progressor.noteCaptureFinished(success: true)
+  _ = progressor.update(makeScanSample(yaw: 40, timestamp: 2))
+
+  let reversed = progressor.update(makeScanSample(yaw: 25, timestamp: 3))
+  #expect(reversed.isWrongDirection)
+  #expect(reversed.blockReason == .reversedDirection)
+
+  // Still short of the ground it gave up, but moving the right way again.
+  let recovering = progressor.update(makeScanSample(yaw: 28, timestamp: 4))
+  #expect(!recovering.isWrongDirection)
+  #expect(recovering.blockReason == nil)
 }
 
 @Test("Experimental packages associate images by stable filename and id")
@@ -1553,6 +1715,129 @@ func experimentalIncompleteSessionsAreCleanedUp() async throws {
   await store.abandon()
   let listed = try await store.listCompletedPackages()
   #expect(listed.isEmpty)
+}
+
+@Test("A sweep that missed some angles is still saved, with the gaps recorded")
+func experimentalFinalizeKeepsSweepWithSkippedAngles() async throws {
+  let root = FileManager.default.temporaryDirectory
+    .appendingPathComponent("SpheraARKitSkips-\(UUID().uuidString)", isDirectory: true)
+  defer { try? FileManager.default.removeItem(at: root) }
+
+  var config = ExperimentalPanoramaConfiguration.default
+  config.horizontalImageCount = 5
+  config.upwardImageCount = 0
+  config.downwardImageCount = 0
+  let store = ExperimentalCapturePackageStore(sessionsRootURL: root)
+  _ = try await store.begin(configuration: config, coreMotionReferenceFrame: "test-frame")
+
+  for index in [0, 1, 3, 4] {
+    _ = try await appendExperimentalFrame(to: store, line: .horizontal, index: index)
+  }
+  try await store.markLineCompleted(.horizontal, skippedCount: 1)
+
+  let package = try await store.finalize(skippedTargets: [
+    ExperimentalSkippedTarget(scanLine: .horizontal, indexInLine: 2, targetYawOffsetDegrees: 144)
+  ])
+  #expect(package.manifest.frames.count == 4)
+  #expect(package.manifest.skippedTargets?.count == 1)
+  #expect(package.manifest.skippedTargets?.first?.indexInLine == 2)
+  #expect(package.manifest.lineSummaries.first?.skippedCount == 1)
+  #expect(try await store.listCompletedPackages().count == 1)
+}
+
+@Test("A sweep with too few photos to be useful is rejected rather than saved")
+func experimentalFinalizeRejectsMostlyEmptySweep() async throws {
+  let root = FileManager.default.temporaryDirectory
+    .appendingPathComponent("SpheraARKitTooFew-\(UUID().uuidString)", isDirectory: true)
+  defer { try? FileManager.default.removeItem(at: root) }
+
+  var config = ExperimentalPanoramaConfiguration.default
+  config.horizontalImageCount = 10
+  config.upwardImageCount = 0
+  config.downwardImageCount = 0
+  let store = ExperimentalCapturePackageStore(sessionsRootURL: root)
+  _ = try await store.begin(configuration: config, coreMotionReferenceFrame: "test-frame")
+  for index in 0..<3 {
+    _ = try await appendExperimentalFrame(to: store, line: .horizontal, index: index)
+  }
+
+  await #expect(throws: ExperimentalCapturePackageError.self) {
+    _ = try await store.finalize()
+  }
+}
+
+@Test("Rolling back an interrupted row drops its photos and renumbers the rest")
+func experimentalStoreDiscardsRowForRestart() async throws {
+  let root = FileManager.default.temporaryDirectory
+    .appendingPathComponent("SpheraARKitRollback-\(UUID().uuidString)", isDirectory: true)
+  defer { try? FileManager.default.removeItem(at: root) }
+
+  var config = ExperimentalPanoramaConfiguration.default
+  config.horizontalImageCount = 2
+  config.upwardImageCount = 2
+  config.downwardImageCount = 0
+  let store = ExperimentalCapturePackageStore(sessionsRootURL: root)
+  _ = try await store.begin(configuration: config, coreMotionReferenceFrame: "test-frame")
+
+  let horizontal = [
+    try await appendExperimentalFrame(to: store, line: .horizontal, index: 0),
+    try await appendExperimentalFrame(to: store, line: .horizontal, index: 1),
+  ]
+  try await store.markLineCompleted(.horizontal, skippedCount: 0)
+  try await store.markLineStarted(.upward)
+  let abandoned = try await appendExperimentalFrame(to: store, line: .upward, index: 0)
+
+  try await store.discardFrames(for: .upward)
+  _ = try await appendExperimentalFrame(to: store, line: .upward, index: 0)
+  _ = try await appendExperimentalFrame(to: store, line: .upward, index: 1)
+
+  let package = try await store.finalize()
+  #expect(package.manifest.frames.count == 4)
+  #expect(package.manifest.frames.map(\.sequenceIndex) == [0, 1, 2, 3])
+  #expect(!package.manifest.frames.contains { $0.id == abandoned.id })
+  #expect(package.manifest.frames.prefix(2).map(\.id) == horizontal.map(\.id))
+  #expect(
+    !FileManager.default.fileExists(
+      atPath: package.imageURL(for: abandoned.imageFilename).path
+    )
+  )
+}
+
+@discardableResult
+private func appendExperimentalFrame(
+  to store: ExperimentalCapturePackageStore,
+  line: PanoramaScanLine,
+  index: Int
+) async throws -> ExperimentalCapturedFrame {
+  try await store.append(
+    imageData: Data([0xff, 0xd8, 0xff, 0xd9]),
+    frameID: UUID(),
+    scanLine: line,
+    indexInLine: index,
+    targetYawOffsetDegrees: Double(index) * 30,
+    actualYawOffsetDegrees: Double(index) * 30,
+    actualPitchDegrees: 0,
+    arkit: makeARKitMetadata(timestamp: TimeInterval(index)),
+    motion: makeMotionSample(
+      quaternion: simd_quatd(angle: -.pi / 2, axis: SIMD3<Double>(1, 0, 0))
+    ),
+    photo: PhotoMetadata(
+      codec: "jpeg",
+      width: 1920,
+      height: 1440,
+      exifOrientation: 1,
+      exposureDurationSeconds: nil,
+      iso: nil,
+      aperture: nil,
+      focalLengthMillimeters: nil,
+      focalLength35mmEquivalent: nil,
+      brightnessValue: nil,
+      exposureBiasValue: nil,
+      lensMake: nil,
+      lensModel: nil
+    ),
+    qualityNotes: []
+  )
 }
 
 private func makeScanSample(

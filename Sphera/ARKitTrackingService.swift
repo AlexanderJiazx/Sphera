@@ -18,17 +18,17 @@ enum ARKitTrackingError: LocalizedError {
   var errorDescription: String? {
     switch self {
     case .unsupported:
-      "ARKit world tracking is not available on this device."
+      "This iPhone does not support the motion tracking that Sweep needs."
     case .permissionDenied:
-      "Camera access is required. Enable it in Settings and reopen Sphera."
+      "Sphera needs access to the camera. You can turn it on in Settings."
     case .sessionFailed(let message):
-      "ARKit session failed: \(message)"
+      message
     case .frameUnavailable:
-      "No ARKit camera frame is available."
+      "The camera did not start. Make sure nothing is covering the lens, then try again."
     case .imageEncodingFailed:
-      "The ARKit camera frame could not be saved as a JPEG."
+      "A photo could not be saved."
     case .notRunning:
-      "The ARKit session is not running."
+      "The camera is not running."
     }
   }
 }
@@ -57,6 +57,7 @@ final class ARKitTrackingService: NSObject, ObservableObject {
   private var lastLoggedTrackingState: ARKitTrackingStateRecord?
   private var runGeneration = 0
   weak var previewView: ARKitPreviewContainerView?
+  nonisolated let livePanoPreview = ExperimentalLivePanoPreview()
 
   override init() {
     super.init()
@@ -291,7 +292,9 @@ final class ARKitTrackingService: NSObject, ObservableObject {
 extension ARKitTrackingService: ARSessionDelegate {
   nonisolated func session(_ session: ARSession, didUpdate frame: ARFrame) {
     previewBufferBox.store(frame.capturedImage)
-    if poseBox.store(Self.makeLivePose(from: frame)) {
+    let pose = Self.makeLivePose(from: frame)
+    livePanoPreview.ingest(pixelBuffer: frame.capturedImage, yawDegrees: pose.yawDegrees)
+    if poseBox.store(pose) {
       Task { @MainActor [weak self] in
         self?.flushFrame()
       }
